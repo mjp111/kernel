@@ -3,6 +3,7 @@
 #define _LINUX_MIGRATE_H
 
 #include <linux/mm.h>
+#include <linux/hmm.h>
 #include <linux/mempolicy.h>
 #include <linux/migrate_mode.h>
 #include <linux/hugetlb.h>
@@ -233,7 +234,12 @@ void migrate_device_pages(unsigned long *src_pfns, unsigned long *dst_pfns,
 			unsigned long npages);
 void migrate_device_finalize(unsigned long *src_pfns,
 			unsigned long *dst_pfns, unsigned long npages);
-
+int migrate_hmm_range_setup(struct hmm_range *range,
+			    struct vm_area_struct *vma,
+			    unsigned long start,
+			    unsigned long end,
+			    struct migrate_vma **pargs);
+void migrate_hmm_range_end(struct migrate_vma *pargs);
 #endif /* CONFIG_MIGRATION */
 
 #endif /* _LINUX_MIGRATE_H */
