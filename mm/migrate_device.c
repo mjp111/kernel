@@ -15,6 +15,7 @@
 #include <linux/rmap.h>
 #include <linux/swapops.h>
 #include <asm/tlbflush.h>
+#include <linux/hmm.h>
 #include "internal.h"
 
 static int migrate_vma_collect_skip(unsigned long start,
@@ -962,4 +963,38 @@ int migrate_device_coherent_folio(struct folio *folio)
 	if (src_pfn & MIGRATE_PFN_MIGRATE)
 		return 0;
 	return -EBUSY;
+}
+
+int migrate_hmm_range_setup(struct hmm_range *range)
+{
+
+	struct migrate_vma *migrate = range->migrate;
+	if (!migrate)
+		return -EINVAL;
+
+	migrate->npages = (migrate->end - migrate->start) >> PAGE_SHIFT;
+	migrate->cpages = 0;
+
+	for (unsigned long i = 0; i < migrate->npages; i++) {
+
+		if ((range->hmm_pfns[i] & (HMM_PFN_VALID | HMM_PFN_MIGRATE)) !=
+		    (HMM_PFN_VALID | HMM_PFN_MIGRATE)) {
+			migrate->src[i] = 0;
+			continue;
+		}
+
+		migrate->cpages++;
+
+		if (range->hmm_pfns[i] == (HMM_PFN_VALID|HMM_PFN_MIGRATE)) {
+			migrate->src[i] = MIGRATE_PFN_MIGRATE;
+			continue;
+		}
+
+		migrate->src[i] = migrate_pfn(page_to_pfn(hmm_pfn_to_page(range->hmm_pfns[i])))
+			| MIGRATE_PFN_MIGRATE;
+		migrate->src[i] |= (range->hmm_pfns[i] & HMM_PFN_WRITE) ? MIGRATE_PFN_WRITE : 0;
+
+	}
+
+	return 0;
 }

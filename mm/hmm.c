@@ -19,6 +19,7 @@
 #include <linux/pagemap.h>
 #include <linux/swapops.h>
 #include <linux/hugetlb.h>
+#include <linux/migrate.h>
 #include <linux/memremap.h>
 #include <linux/sched/mm.h>
 #include <linux/jump_label.h>
@@ -31,6 +32,10 @@
 struct hmm_vma_walk {
 	struct hmm_range	*range;
 	unsigned long		last;
+	struct mmu_notifier_range mmu_range;
+	struct vm_area_struct 	*vma;
+	unsigned long 		start;
+	unsigned long 		end;
 };
 
 enum {
@@ -317,6 +322,165 @@ fault:
 	return hmm_vma_fault(addr, end, required_fault, walk);
 }
 
+/*
+  folios related to hmm_pfn is reference elevated and locked after this call
+  if migration requested and successfull.
+*/
+static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
+					   unsigned long addr,
+					   pte_t *ptep,
+					   unsigned long *hmm_pfn,
+					   spinlock_t *ptl)
+{
+	struct hmm_vma_walk *hmm_vma_walk = walk->private;
+	struct hmm_range *range = hmm_vma_walk->range;
+	struct mm_struct *mm = walk->vma->vm_mm;
+	bool anon_exclusive;
+	struct folio *folio;
+	unsigned long pfn;
+	struct page *page;
+	swp_entry_t entry;
+	pte_t pte, swp_pte;
+	bool writable;
+
+	if (!(range->default_flags & HMM_PFN_REQ_MIGRATE))
+		return;
+
+	if (!(*hmm_pfn & HMM_PFN_VALID))
+		return;
+
+	spin_lock(ptl);
+
+	pte = ptep_get(ptep);
+	if (!pte_present(pte))
+		goto out;
+
+	pfn = pte_pfn(pte);
+
+	if (is_zero_pfn(pfn)) {
+		*hmm_pfn = HMM_PFN_MIGRATE|HMM_PFN_VALID;
+		goto out;
+	}
+
+	if ((*hmm_pfn & ~HMM_PFN_FLAGS) != pfn)
+		goto out;
+
+	page = vm_normal_page(walk->vma, addr, pte);
+	folio = page_folio(page);
+
+	folio_get(folio);
+
+	if (folio_trylock(folio)) {
+		anon_exclusive = folio_test_anon(folio) &&
+			PageAnonExclusive(page);
+
+		flush_cache_page(walk->vma, addr, pfn);
+
+		if (anon_exclusive) {
+			pte = ptep_clear_flush(walk->vma, addr, ptep);
+
+			if (folio_try_share_anon_rmap_pte(folio, page)) {
+				set_pte_at(mm, addr, ptep, pte);
+				folio_unlock(folio);
+				folio_put(folio);
+				goto out;
+			}
+		} else {
+			pte = ptep_get_and_clear(mm, addr, ptep);
+		}
+
+		writable = pte_write(pte);
+
+		/* Setup special migration page table entry */
+		if (writable)
+			entry = make_writable_migration_entry(pfn);
+		else if (anon_exclusive)
+			entry = make_readable_exclusive_migration_entry(pfn);
+		else
+			entry = make_readable_migration_entry(pfn);
+
+		swp_pte = swp_entry_to_pte(entry);
+
+		if (pte_soft_dirty(pte))
+			swp_pte = pte_swp_mksoft_dirty(swp_pte);
+		if (pte_uffd_wp(pte))
+			swp_pte = pte_swp_mkuffd_wp(swp_pte);
+
+		set_pte_at(mm, addr, ptep, swp_pte);
+		folio_remove_rmap_pte(folio, page, walk->vma);
+		folio_put(folio);
+		*hmm_pfn |= pfn | HMM_PFN_MIGRATE;
+	}
+out:
+	spin_unlock(ptl);
+}
+
+static int hmm_vma_walk_split(pmd_t *pmdp,
+			      unsigned long addr,
+			      struct mm_walk *walk)
+{
+	struct folio *folio;
+        spinlock_t *ptl;
+	int ret = 0;
+
+	ptl = pmd_lock(walk->mm, pmdp);
+	if (unlikely(!pmd_trans_huge(*pmdp))) {
+		spin_unlock(ptl);
+		goto out;
+	}
+
+	folio = pmd_folio(*pmdp);
+	if (is_huge_zero_folio(folio)) {
+		spin_unlock(ptl);
+		split_huge_pmd(walk->vma, pmdp, addr);
+	} else {
+		folio_get(folio);
+		spin_unlock(ptl);
+		if (unlikely(!folio_trylock(folio))){
+			folio_put(folio);
+			goto busy;
+		}
+		ret = split_folio(folio);
+		folio_unlock(folio);
+		folio_put(folio);
+		if (ret)
+			goto busy;
+	}
+
+out:
+	return ret;
+busy:
+	return -EBUSY;
+}
+
+static int hmm_vma_capture_migrate_range(unsigned long start, unsigned long end, struct mm_walk *walk)
+{
+	struct hmm_vma_walk *hmm_vma_walk = walk->private;
+	struct hmm_range *range = hmm_vma_walk->range;
+
+	if (!(range->default_flags & HMM_PFN_REQ_MIGRATE))
+		return 0;
+
+	if (hmm_vma_walk->vma && (hmm_vma_walk->vma != walk->vma))
+		return -ERANGE;
+
+	hmm_vma_walk->vma = walk->vma;
+	hmm_vma_walk->start = start;
+	hmm_vma_walk->end = end;
+
+	if (end - start > range->end - range->start)
+		return -ERANGE;
+
+	if (!hmm_vma_walk->mmu_range.owner) {
+		mmu_notifier_range_init_owner(&hmm_vma_walk->mmu_range, MMU_NOTIFY_MIGRATE, 0,
+					      walk->vma->vm_mm, start, end,
+					      range->dev_private_owner);
+		mmu_notifier_invalidate_range_start(&hmm_vma_walk->mmu_range);
+	}
+
+	return 0;
+}
+
 static int hmm_vma_walk_pmd(pmd_t *pmdp,
 			    unsigned long start,
 			    unsigned long end,
@@ -328,6 +492,7 @@ static int hmm_vma_walk_pmd(pmd_t *pmdp,
 		&range->hmm_pfns[(start - range->start) >> PAGE_SHIFT];
 	unsigned long npages = (end - start) >> PAGE_SHIFT;
 	unsigned long addr = start;
+	spinlock_t *ptl;
 	pte_t *ptep;
 	pmd_t pmd;
 
@@ -351,6 +516,18 @@ again:
 		return hmm_pfns_fill(start, end, range, HMM_PFN_ERROR);
 	}
 
+	if ((hmm_vma_walk->range->default_flags & HMM_PFN_REQ_MIGRATE) &&
+	    pmd_trans_huge(pmd)) {
+		int r;
+		r = hmm_vma_walk_split(pmdp, addr, walk);
+		if (r == -EBUSY) {
+			/* Split not successful, skip */
+			return hmm_pfns_fill(start, end, range, 0);
+		}
+		/* Split successful, reloop */
+		return -EBUSY;
+	}
+
 	if (pmd_devmap(pmd) || pmd_trans_huge(pmd)) {
 		/*
 		 * No need to take pmd_lock here, even if some other thread
@@ -365,7 +542,7 @@ again:
 		if (!pmd_devmap(pmd) && !pmd_trans_huge(pmd))
 			goto again;
 
-		return hmm_vma_handle_pmd(walk, addr, end, hmm_pfns, pmd);
+		return  hmm_vma_handle_pmd(walk, addr, end, hmm_pfns, pmd);
 	}
 
 	/*
@@ -380,7 +557,7 @@ again:
 		return hmm_pfns_fill(start, end, range, HMM_PFN_ERROR);
 	}
 
-	ptep = pte_offset_map(pmdp, addr);
+	ptep = pte_offset_map_nolock(walk->mm, pmdp, addr, &ptl);
 	if (!ptep)
 		goto again;
 	for (; addr < end; addr += PAGE_SIZE, ptep++, hmm_pfns++) {
@@ -391,8 +568,11 @@ again:
 			/* hmm_vma_handle_pte() did pte_unmap() */
 			return r;
 		}
+
+		hmm_vma_handle_migrate_prepare(walk, addr, ptep, hmm_pfns, ptl);
 	}
 	pte_unmap(ptep - 1);
+
 	return 0;
 }
 
@@ -523,6 +703,11 @@ static int hmm_vma_walk_test(unsigned long start, unsigned long end,
 	struct hmm_vma_walk *hmm_vma_walk = walk->private;
 	struct hmm_range *range = hmm_vma_walk->range;
 	struct vm_area_struct *vma = walk->vma;
+	int r;
+
+	r = hmm_vma_capture_migrate_range(start, end, walk);
+	if (r)
+		return r;
 
 	if (!(vma->vm_flags & (VM_IO | VM_PFNMAP)) &&
 	    vma->vm_flags & VM_READ)
@@ -575,9 +760,17 @@ static const struct mm_walk_ops hmm_walk_ops = {
  *		the invalidation to finish.
  * -EFAULT:     A page was requested to be valid and could not be made valid
  *              ie it has no backing VMA or it is illegal to access
+ * -ERANGE:     The range crosses multiple VMAs, or space for hmm_pfns array
+ *              is too low.
  *
  * This is similar to get_user_pages(), except that it can read the page tables
  * without mutating them (ie causing faults).
+ *
+ * If want to do migrate after faultin, call hmm_range_fault() with
+ * HMM_PFN_REQ_MIGRATE and initialize range.migrate field.
+ * After hmm_range_fault() call migrate_hmm_range_setup() instead of
+ * migrate_vma_setup() and after that follow normal migrate calls path.
+ *
  */
 int hmm_range_fault(struct hmm_range *range)
 {
@@ -604,6 +797,14 @@ int hmm_range_fault(struct hmm_range *range)
 		 * output, and all >= are still at their input values.
 		 */
 	} while (ret == -EBUSY);
+
+	if (range->default_flags & HMM_PFN_REQ_MIGRATE && range->migrate) {
+		range->migrate->vma = hmm_vma_walk.vma;
+		range->migrate->start = hmm_vma_walk.start;
+		range->migrate->end = hmm_vma_walk.end;
+		mmu_notifier_invalidate_range_end(&hmm_vma_walk.mmu_range);
+	}
+
 	return ret;
 }
 EXPORT_SYMBOL(hmm_range_fault);
