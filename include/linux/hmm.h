@@ -36,11 +36,13 @@ enum hmm_pfn_flags {
 	HMM_PFN_VALID = 1UL << (BITS_PER_LONG - 1),
 	HMM_PFN_WRITE = 1UL << (BITS_PER_LONG - 2),
 	HMM_PFN_ERROR = 1UL << (BITS_PER_LONG - 3),
+	HMM_PFN_MIGRATE = 1UL << (BITS_PER_LONG - 4),
 	HMM_PFN_ORDER_SHIFT = (BITS_PER_LONG - 8),
 
 	/* Input flags */
 	HMM_PFN_REQ_FAULT = HMM_PFN_VALID,
 	HMM_PFN_REQ_WRITE = HMM_PFN_WRITE,
+	HMM_PFN_REQ_MIGRATE = HMM_PFN_MIGRATE,
 
 	HMM_PFN_FLAGS = 0xFFUL << HMM_PFN_ORDER_SHIFT,
 };
@@ -73,7 +75,7 @@ static inline struct page *hmm_pfn_to_page(unsigned long hmm_pfn)
  */
 static inline unsigned int hmm_pfn_to_map_order(unsigned long hmm_pfn)
 {
-	return (hmm_pfn >> HMM_PFN_ORDER_SHIFT) & 0x1F;
+	return (hmm_pfn >> HMM_PFN_ORDER_SHIFT) & 0x0F;
 }
 
 /*
@@ -103,6 +105,8 @@ struct hmm_range {
  * Please see Documentation/mm/hmm.rst for how to use the range API.
  */
 int hmm_range_fault(struct hmm_range *range);
+
+int hmm_range_migrate_prepare(struct hmm_range *range);
 
 /*
  * HMM_RANGE_DEFAULT_TIMEOUT - default timeout (ms) when waiting for a range

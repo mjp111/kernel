@@ -15,6 +15,7 @@
 #include <linux/rmap.h>
 #include <linux/swapops.h>
 #include <asm/tlbflush.h>
+#include <linux/hmm.h>
 #include "internal.h"
 
 static int migrate_vma_collect_skip(unsigned long start,
@@ -963,3 +964,23 @@ int migrate_device_coherent_folio(struct folio *folio)
 		return 0;
 	return -EBUSY;
 }
+
+int migrate_device_hmm_range(struct hmm_range *range, unsigned long *dst_pfns, unsigned long npages)
+{
+	unsigned long *src_pfns, i;
+
+	src_pfns = kvcalloc(npages, sizeof(*src_pfns), GFP_KERNEL | __GFP_NOFAIL);
+
+	for (i = 0; i < npages; i++) {
+		src_pfns[i] = migrate_pfn(page_to_pfn(hmm_pfn_to_page(range->hmm_pfns[i])))
+					  | MIGRATE_PFN_MIGRATE;
+
+	}
+	migrate_device_pages(src_pfns, dst_pfns, npages);
+	migrate_device_finalize(src_pfns, dst_pfns, npages);
+
+	kvfree(src_pfns);
+
+	return 0;
+}
+EXPORT_SYMBOL(migrate_device_hmm_range);
