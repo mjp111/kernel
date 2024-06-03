@@ -317,6 +317,71 @@ fault:
 	return hmm_vma_fault(addr, end, required_fault, walk);
 }
 
+/*
+  folios related to hmm_pfn is reference elevated and locked after this call
+  if migration requested and successfull.
+*/
+static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
+					   unsigned long addr,
+					   pte_t *ptep,
+					   unsigned long *hmm_pfn)
+
+{
+	struct hmm_vma_walk *hmm_vma_walk = walk->private;
+	struct hmm_range *range = hmm_vma_walk->range;
+	struct mm_struct *mm = walk->vma->vm_mm;
+
+	bool anon_exclusive;
+	struct folio *folio;
+	unsigned long pfn;
+	struct page *page;
+	bool writable;
+	swp_entry_t entry;
+	pte_t pte, swp_pte;
+	pte = ptep_get(ptep);
+
+	if (!(range->default_flags & HMM_PFN_REQ_MIGRATE))
+		return;
+
+	if (!pte_present(pte))
+		return;
+
+	writable = pte_write(pte);
+	pfn = pte_pfn(pte);
+//zeropage?
+	page = vm_normal_page(walk->vma, addr, pte);
+	folio = page_folio(page);
+
+	folio_get(folio);
+
+	if (folio_trylock(folio)) {
+
+		/* Setup special migration page table entry */
+		if (writable)
+			entry = make_writable_migration_entry(
+				page_to_pfn(page));
+		else if (anon_exclusive)
+			entry = make_readable_exclusive_migration_entry(
+				page_to_pfn(page));
+		else
+			entry = make_readable_migration_entry(
+				page_to_pfn(page));
+
+		swp_pte = swp_entry_to_pte(entry);
+
+		if (pte_soft_dirty(pte))
+			swp_pte = pte_swp_mksoft_dirty(swp_pte);
+		if (pte_uffd_wp(pte))
+			swp_pte = pte_swp_mkuffd_wp(swp_pte);
+
+		set_pte_at(mm, addr, ptep, swp_pte);
+		folio_remove_rmap_pte(folio, page, vma);
+		folio_put(folio);
+		*hmm_pfn |= HMM_PFN_MIGRATE;
+	}
+
+}
+
 static int hmm_vma_walk_pmd(pmd_t *pmdp,
 			    unsigned long start,
 			    unsigned long end,
@@ -391,6 +456,9 @@ again:
 			/* hmm_vma_handle_pte() did pte_unmap() */
 			return r;
 		}
+
+		hmm_vma_handle_migrate_prepare(walk, addr, ptep, hmm_pfns);
+
 	}
 	pte_unmap(ptep - 1);
 	return 0;
