@@ -324,8 +324,8 @@ fault:
 static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 					   unsigned long addr,
 					   pte_t *ptep,
-					   unsigned long *hmm_pfn)
-
+					   unsigned long *hmm_pfn,
+					   spinlock_t *ptl)
 {
 	struct hmm_vma_walk *hmm_vma_walk = walk->private;
 	struct hmm_range *range = hmm_vma_walk->range;
@@ -343,8 +343,9 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 	if (!(range->default_flags & HMM_PFN_REQ_MIGRATE))
 		return;
 
+	spin_lock(ptl);
 	if (!pte_present(pte))
-		return;
+		goto out;
 
 	writable = pte_write(pte);
 	pfn = pte_pfn(pte);
@@ -375,11 +376,12 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 			swp_pte = pte_swp_mkuffd_wp(swp_pte);
 
 		set_pte_at(mm, addr, ptep, swp_pte);
-		folio_remove_rmap_pte(folio, page, vma);
+		folio_remove_rmap_pte(folio, page, walk->vma);
 		folio_put(folio);
 		*hmm_pfn |= HMM_PFN_MIGRATE;
 	}
-
+out:
+	spin_unlock(ptl);
 }
 
 static int hmm_vma_walk_pmd(pmd_t *pmdp,
@@ -393,6 +395,7 @@ static int hmm_vma_walk_pmd(pmd_t *pmdp,
 		&range->hmm_pfns[(start - range->start) >> PAGE_SHIFT];
 	unsigned long npages = (end - start) >> PAGE_SHIFT;
 	unsigned long addr = start;
+	spinlock_t *ptl;
 	pte_t *ptep;
 	pmd_t pmd;
 
@@ -445,7 +448,7 @@ again:
 		return hmm_pfns_fill(start, end, range, HMM_PFN_ERROR);
 	}
 
-	ptep = pte_offset_map(pmdp, addr);
+	ptep = pte_offset_map_nolock(walk->mm, pmdp, addr, &ptl);
 	if (!ptep)
 		goto again;
 	for (; addr < end; addr += PAGE_SIZE, ptep++, hmm_pfns++) {
@@ -457,7 +460,7 @@ again:
 			return r;
 		}
 
-		hmm_vma_handle_migrate_prepare(walk, addr, ptep, hmm_pfns);
+		hmm_vma_handle_migrate_prepare(walk, addr, ptep, hmm_pfns, ptl);
 
 	}
 	pte_unmap(ptep - 1);
