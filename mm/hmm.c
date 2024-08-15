@@ -347,9 +347,8 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 	if (!pte_present(pte))
 		goto out;
 
-	writable = pte_write(pte);
 	pfn = pte_pfn(pte);
-//zeropage?
+
 	page = vm_normal_page(walk->vma, addr, pte);
 	folio = page_folio(page);
 
@@ -357,16 +356,33 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 
 	if (folio_trylock(folio)) {
 
+		anon_exclusive = folio_test_anon(folio) &&
+			PageAnonExclusive(page);
+
+		flush_cache_page(walk->vma, addr, pfn);
+
+		if (anon_exclusive) {
+			pte = ptep_clear_flush(walk->vma, addr, ptep);
+
+			if (folio_try_share_anon_rmap_pte(folio, page)) {
+				set_pte_at(mm, addr, ptep, pte);
+				folio_unlock(folio);
+				folio_put(folio);
+				goto out;
+			}
+		} else {
+			pte = ptep_get_and_clear(mm, addr, ptep);
+		}
+
+		writable = pte_write(pte);
+
 		/* Setup special migration page table entry */
 		if (writable)
-			entry = make_writable_migration_entry(
-				page_to_pfn(page));
+			entry = make_writable_migration_entry(pfn);
 		else if (anon_exclusive)
-			entry = make_readable_exclusive_migration_entry(
-				page_to_pfn(page));
+			entry = make_readable_exclusive_migration_entry(pfn);
 		else
-			entry = make_readable_migration_entry(
-				page_to_pfn(page));
+			entry = make_readable_migration_entry(pfn);
 
 		swp_pte = swp_entry_to_pte(entry);
 
@@ -378,7 +394,7 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 		set_pte_at(mm, addr, ptep, swp_pte);
 		folio_remove_rmap_pte(folio, page, walk->vma);
 		folio_put(folio);
-		*hmm_pfn |= HMM_PFN_MIGRATE;
+		*hmm_pfn |= pfn | HMM_PFN_MIGRATE;
 	}
 out:
 	spin_unlock(ptl);
