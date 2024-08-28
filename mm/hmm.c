@@ -702,7 +702,14 @@ int hmm_range_fault(struct hmm_range *range)
 }
 EXPORT_SYMBOL(hmm_range_fault);
 
-int hmm_range_migrate(struct hmm_range *range)
+static int hmm_range_isolate_unmap(struct hmm_range *range)
+{
+	int ret = 0;
+	return ret;
+
+}
+
+int hmm_range_migrate_prepare(struct hmm_range *range)
 {
 
 	struct hmm_vma_walk hmm_vma_walk = {
@@ -732,6 +739,25 @@ int hmm_range_migrate(struct hmm_range *range)
 		 */
 
 	} while (ret == -EBUSY);
+
+	ret = hmm_range_isolate_unmap(range);
+
 	return ret;
 }
-EXPORT_SYMBOL(hmm_range_migrate);
+EXPORT_SYMBOL(hmm_range_migrate_prepare);
+
+/*
+  Between hmm_range_migrate_prepare() and hmm_range_migrate_finalize()
+  you copy the actual page contents in a driver spesific way.
+*/
+
+int hmm_range_migrate_finalize(struct hmm_range *range)
+{
+	int ret = 0;
+
+	//migrate_device_pages();
+	//migrate_device_finalize();
+
+	return ret;
+}
+EXPORT_SYMBOL(hmm_range_migrate_finalize);
