@@ -330,6 +330,7 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 	struct hmm_vma_walk *hmm_vma_walk = walk->private;
 	struct hmm_range *range = hmm_vma_walk->range;
 	struct mm_struct *mm = walk->vma->vm_mm;
+	struct mmu_notifier_range mmu_range;
 
 	bool anon_exclusive;
 	struct folio *folio;
@@ -355,6 +356,11 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 	folio_get(folio);
 
 	if (folio_trylock(folio)) {
+		mmu_notifier_range_init_owner(&mmu_range, MMU_NOTIFY_MIGRATE, 0,
+					      mm, range->start, range->end,
+					      range->dev_private_owner);
+
+		mmu_notifier_invalidate_range_start(&mmu_range);
 
 		anon_exclusive = folio_test_anon(folio) &&
 			PageAnonExclusive(page);
@@ -395,6 +401,7 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 		folio_remove_rmap_pte(folio, page, walk->vma);
 		folio_put(folio);
 		*hmm_pfn |= pfn | HMM_PFN_MIGRATE;
+		mmu_notifier_invalidate_range_end(&mmu_range);
 	}
 out:
 	spin_unlock(ptl);
@@ -694,3 +701,37 @@ int hmm_range_fault(struct hmm_range *range)
 	return ret;
 }
 EXPORT_SYMBOL(hmm_range_fault);
+
+int hmm_range_migrate(struct hmm_range *range)
+{
+
+	struct hmm_vma_walk hmm_vma_walk = {
+		.range = range,
+		.last = range->start,
+	};
+	struct mm_struct *mm = range->notifier->mm;
+	int ret;
+
+	mmap_assert_locked(mm);
+
+	range->default_flags |= HMM_PFN_REQ_MIGRATE;
+
+	do {
+		/* If range is no longer valid force retry. */
+		if (mmu_interval_check_retry(range->notifier,
+					     range->notifier_seq))
+			return -EBUSY;
+
+		ret = walk_page_range(mm, hmm_vma_walk.last, range->end,
+				      &hmm_walk_ops, &hmm_vma_walk);
+		/*
+		 * When -EBUSY is returned the loop restarts with
+		 * hmm_vma_walk.last set to an address that has not been stored
+		 * in pfns. All entries < last in the pfn array are set to their
+		 * output, and all >= are still at their input values.
+		 */
+
+	} while (ret == -EBUSY);
+	return ret;
+}
+EXPORT_SYMBOL(hmm_range_migrate);

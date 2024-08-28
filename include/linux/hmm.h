@@ -106,6 +106,8 @@ struct hmm_range {
  */
 int hmm_range_fault(struct hmm_range *range);
 
+int hmm_range_migrate(struct hmm_range *range);
+
 /*
  * HMM_RANGE_DEFAULT_TIMEOUT - default timeout (ms) when waiting for a range
  *
