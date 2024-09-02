@@ -702,16 +702,99 @@ int hmm_range_fault(struct hmm_range *range)
 }
 EXPORT_SYMBOL(hmm_range_fault);
 
+static bool hmm_check_page_refs(struct page *page)
+{
+	struct folio *folio = page_folio(page);
+	/*
+         * One extra ref because caller holds an extra reference, either from
+         * isolate_lru_page() for a regular page, or hmm_vma_handle_migrate_prepare() for
+         * a device page.
+         */
+        int extra = 1;
+
+        /*
+         * FIXME support THP (transparent huge page)
+         */
+        if (folio_test_large(folio))
+                return false;
+
+        /* For file back page */
+	if (folio_mapping(folio))
+                extra += 1 + folio_has_private(folio);
+
+	if ((folio_ref_count(folio) - extra) > folio_mapcount(folio))
+                return false;
+
+        return true;
+}
+
 static int hmm_range_isolate_unmap(struct hmm_range *range)
 {
-	int ret = 0;
-	return ret;
+	unsigned long addr, i, j, restore = 0;
+	bool allow_drain = true;
 
+	int ret = 0;
+
+	lru_add_drain();
+
+	for (i = 0, addr = range->start; addr < range->end; addr += PAGE_SIZE, i++) {
+		struct folio *folio;
+
+		if (!(range->hmm_pfns[i] & HMM_PFN_MIGRATE))
+			continue;
+
+		struct page *page = hmm_pfn_to_page(range->hmm_pfns[i]);
+		if (!PageLRU(page) && allow_drain) {
+			/* Drain CPU's lru cache */
+			lru_add_drain_all();
+			allow_drain = false;
+		}
+
+		if (!isolate_lru_page(page)) {
+			range->hmm_pfns[i] &= ~HMM_PFN_MIGRATE;
+			restore++;
+			continue;
+		}
+
+		/* Drop the reference we took in hmm_vma_handle_migrate_prepare */
+		put_page(page);
+
+		folio = page_folio(page);
+                if (folio_mapped(folio))
+                        try_to_migrate(folio, 0);
+
+                if (page_mapped(page) ||
+		    !hmm_check_page_refs(page)) {
+			get_page(page);
+			putback_lru_page(page);
+		}
+		range->hmm_pfns[i] &= ~HMM_PFN_MIGRATE;
+		restore++;
+		continue;
+	}
+
+	for (j = 0; j < i && restore; j++) {
+		struct page *page = hmm_pfn_to_page(range->hmm_pfns[j]);
+                struct folio *folio;
+
+                if (!page || range->hmm_pfns[i] & HMM_PFN_MIGRATE)
+                        continue;
+
+                folio = page_folio(page);
+                remove_migration_ptes(folio, folio, false);
+
+                range->hmm_pfns[j] = 0;
+                folio_unlock(folio);
+                folio_put(folio);
+                restore--;
+
+	}
+
+	return ret;
 }
 
 int hmm_range_migrate_prepare(struct hmm_range *range)
 {
-
 	struct hmm_vma_walk hmm_vma_walk = {
 		.range = range,
 		.last = range->start,
