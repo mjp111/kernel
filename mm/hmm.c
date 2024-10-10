@@ -406,6 +406,41 @@ out:
 	mmu_notifier_invalidate_range_end(&mmu_range);
 }
 
+static int hmm_vma_walk_split(pmd_t *pmdp,
+			      struct mm_walk *walk)
+{
+	struct folio *folio;
+        spinlock_t *ptl;
+	int ret = 0;
+
+	ptl = pmd_lock(walk->mm, pmdp);
+	if (unlikely(!pmd_trans_huge(*pmdp))) {
+		spin_unlock(ptl);
+		goto out;
+	}
+
+	folio = pmd_folio(*pmdp);
+	if (is_huge_zero_folio(folio)) {
+		spin_unlock(ptl);
+		split_huge_pmd(vma, pmdp, addr);
+	} else {
+		folio_get(folio);
+		spin_unlock(ptl);
+		if (unlikely(!folio_trylock(folio)))
+			goto out;
+		ret = split_folio(folio);
+		folio_unlock(folio);
+		folio_put(folio);
+		if (ret)
+			goto out;
+	}
+
+	return ret;
+
+out:
+	return -EBUSY;
+}
+
 static int hmm_vma_walk_pmd(pmd_t *pmdp,
 			    unsigned long start,
 			    unsigned long end,
@@ -442,6 +477,7 @@ again:
 	}
 
 	if (pmd_devmap(pmd) || pmd_trans_huge(pmd)) {
+		int r;
 		/*
 		 * No need to take pmd_lock here, even if some other thread
 		 * is splitting the huge pmd we will get that event through
@@ -455,7 +491,12 @@ again:
 		if (!pmd_devmap(pmd) && !pmd_trans_huge(pmd))
 			goto again;
 
-		return hmm_vma_handle_pmd(walk, addr, end, hmm_pfns, pmd);
+		r =  hmm_vma_handle_pmd(walk, addr, end, hmm_pfns, pmd);
+		if (r)
+			return r;
+		if ((hmm_vma_walk->range->default_flags & HMM_PFN_REQ_MIGRATE) &&
+		    pmd_trans_huge(pmd))
+			hmm_vma_walk_split(pmdp, walk);
 	}
 
 	/*
