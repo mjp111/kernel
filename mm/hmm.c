@@ -331,18 +331,20 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 	struct hmm_range *range = hmm_vma_walk->range;
 	struct mm_struct *mm = walk->vma->vm_mm;
 	struct mmu_notifier_range mmu_range;
-
 	bool anon_exclusive;
 	struct folio *folio;
 	unsigned long pfn;
 	struct page *page;
-	bool writable;
 	swp_entry_t entry;
 	pte_t pte, swp_pte;
-	pte = ptep_get(ptep);
+	bool writable;
 
 	if (!(range->default_flags & HMM_PFN_REQ_MIGRATE))
 		return;
+
+	if (!(*hmm_pfn & HMM_PFN_VALID))
+		return;
+
 	mmu_notifier_range_init_owner(&mmu_range, MMU_NOTIFY_MIGRATE, 0,
 				      mm, range->start, range->end,
 				      range->dev_private_owner);
@@ -350,10 +352,15 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 	mmu_notifier_invalidate_range_start(&mmu_range);
 
 	spin_lock(ptl);
+
+	pte = ptep_get(ptep);
 	if (!pte_present(pte))
 		goto out;
 
 	pfn = pte_pfn(pte);
+
+	if ((*hmm_pfn & ~HMM_PFN_FLAGS) != pfn)
+		goto out;
 
 	page = vm_normal_page(walk->vma, addr, pte);
 	folio = page_folio(page);
