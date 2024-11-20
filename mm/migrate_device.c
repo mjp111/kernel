@@ -998,3 +998,4 @@ int migrate_hmm_range_setup(struct hmm_range *range)
 
 	return 0;
 }
+EXPORT_SYMBOL(migrate_hmm_range_setup);
