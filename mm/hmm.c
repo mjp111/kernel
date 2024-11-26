@@ -423,6 +423,7 @@ static int hmm_vma_walk_split(pmd_t *pmdp,
         spinlock_t *ptl;
 	int ret = 0;
 
+	printk("hmm_vma_walk_split(): begin to split\n");
 	ptl = pmd_lock(walk->mm, pmdp);
 	if (unlikely(!pmd_trans_huge(*pmdp))) {
 		spin_unlock(ptl);
@@ -443,13 +444,13 @@ static int hmm_vma_walk_split(pmd_t *pmdp,
 		ret = split_folio(folio);
 		folio_unlock(folio);
 		folio_put(folio);
-		if (ret)
-			goto busy;
 	}
 
+	printk("hmm_vma_walk_split(): end of split %d\n", ret);
 out:
 	return ret;
 busy:
+	printk("hmm_vma_walk_split(): busy\n");
 	return -EBUSY;
 }
 
@@ -520,7 +521,7 @@ again:
 	    pmd_trans_huge(pmd)) {
 		int r;
 		r = hmm_vma_walk_split(pmdp, addr, walk);
-		if (r == -EBUSY) {
+		if (r ) {
 			/* Split not successful, skip */
 			return hmm_pfns_fill(start, end, range, 0);
 		}
