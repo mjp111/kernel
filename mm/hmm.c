@@ -525,6 +525,7 @@ again:
 			return hmm_pfns_fill(start, end, range, 0);
 		}
 		/* Split successful, reloop */
+		hmm_vma_walk->last = addr;
 		return -EBUSY;
 	}
 
