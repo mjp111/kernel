@@ -260,6 +260,7 @@ static bool dmirror_interval_invalidate(struct mmu_interval_notifier *mni,
 {
 	struct dmirror *dmirror = container_of(mni, struct dmirror, notifier);
 
+	printk("test_hmm: interval notifier called\n");
 	/*
 	 * Ignore invalidation callbacks for device private pages since
 	 * the invalidation is handled as part of the migration process.
@@ -274,6 +275,7 @@ static bool dmirror_interval_invalidate(struct mmu_interval_notifier *mni,
 		return false;
 
 	mmu_interval_set_seq(mni, cur_seq);
+	printk("test_hmm: interval notifier seq update %lu\n", cur_seq);
 	dmirror_do_update(dmirror, range->start, range->end);
 
 	mutex_unlock(&dmirror->mutex);

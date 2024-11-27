@@ -520,12 +520,15 @@ again:
 	if ((hmm_vma_walk->range->default_flags & HMM_PFN_REQ_MIGRATE) &&
 	    pmd_trans_huge(pmd)) {
 		int r;
+		printk("hmm_vma_walk_pmd(): need to split\n");
 		r = hmm_vma_walk_split(pmdp, addr, walk);
 		if (r ) {
+			printk("hmm_vma_walk_pmd(): split failed\n");
 			/* Split not successful, skip */
 			return hmm_pfns_fill(start, end, range, 0);
 		}
 		/* Split successful, reloop */
+		printk("Split successful, reloop\n");
 		hmm_vma_walk->last = addr;
 		return -EBUSY;
 	}
@@ -790,6 +793,8 @@ int hmm_range_fault(struct hmm_range *range)
 		if (mmu_interval_check_retry(range->notifier,
 					     range->notifier_seq))
 			return -EBUSY;
+
+		printk("hmm: walking page range %lx-%lx\n",  hmm_vma_walk.last, range->end);
 		ret = walk_page_range(mm, hmm_vma_walk.last, range->end,
 				      &hmm_walk_ops, &hmm_vma_walk);
 		/*
