@@ -327,10 +327,9 @@ fault:
   if migration requested and successfull.
 */
 static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
+					   pmd_t *pmdp,
 					   unsigned long addr,
-					   pte_t *ptep,
-					   unsigned long *hmm_pfn,
-					   spinlock_t *ptl)
+					   unsigned long *hmm_pfn)
 {
 	struct hmm_vma_walk *hmm_vma_walk = walk->private;
 	struct hmm_range *range = hmm_vma_walk->range;
@@ -341,7 +340,9 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 	struct page *page;
 	swp_entry_t entry;
 	pte_t pte, swp_pte;
+	spinlock_t *ptl;
 	bool writable;
+	pte_t *ptep;
 
 	if (!(range->default_flags & HMM_PFN_REQ_MIGRATE))
 		return;
@@ -349,7 +350,7 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 	if (!(*hmm_pfn & HMM_PFN_VALID))
 		return;
 
-	spin_lock(ptl);
+	ptep = pte_offset_map_lock(mm, pmdp, addr, &ptl);
 
 	pte = ptep_get(ptep);
 	if (!pte_present(pte))
@@ -412,7 +413,8 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 		*hmm_pfn |= pfn | HMM_PFN_MIGRATE;
 	}
 out:
-	spin_unlock(ptl);
+	pte_unmap_unlock(ptep, ptl);
+
 }
 
 static int hmm_vma_walk_split(pmd_t *pmdp,
@@ -493,7 +495,6 @@ static int hmm_vma_walk_pmd(pmd_t *pmdp,
 		&range->hmm_pfns[(start - range->start) >> PAGE_SHIFT];
 	unsigned long npages = (end - start) >> PAGE_SHIFT;
 	unsigned long addr = start;
-	spinlock_t *ptl;
 	pte_t *ptep;
 	pmd_t pmd;
 
@@ -562,7 +563,7 @@ again:
 		return hmm_pfns_fill(start, end, range, HMM_PFN_ERROR);
 	}
 
-	ptep = pte_offset_map_nolock(walk->mm, pmdp, addr, &ptl);
+	ptep = pte_offset_map(pmdp, addr);
 	if (!ptep)
 		goto again;
 	for (; addr < end; addr += PAGE_SIZE, ptep++, hmm_pfns++) {
@@ -574,7 +575,7 @@ again:
 			return r;
 		}
 
-		hmm_vma_handle_migrate_prepare(walk, addr, ptep, hmm_pfns, ptl);
+		hmm_vma_handle_migrate_prepare(walk, pmdp, addr, hmm_pfns);
 	}
 	pte_unmap(ptep - 1);
 
