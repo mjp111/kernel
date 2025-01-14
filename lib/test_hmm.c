@@ -270,8 +270,10 @@ static bool dmirror_interval_invalidate(struct mmu_interval_notifier *mni,
 		return true;
 
 	if (range->event == MMU_NOTIFY_CLEAR &&
-	    range->owner == current)
+	    range->owner == current) {
+		printk("test_hmm: interval_invalidate skipped");
 		return true;
+	}
 
 	if (mmu_notifier_range_blockable(range))
 		mutex_lock(&dmirror->mutex);
@@ -279,7 +281,8 @@ static bool dmirror_interval_invalidate(struct mmu_interval_notifier *mni,
 		return false;
 
 	mmu_interval_set_seq(mni, cur_seq);
-	printk("test_hmm: interval notifier seq update %lu\n", cur_seq);
+	printk("test_hmm: interval_invalidate event %d seq update %lu\n",
+	       range->event, cur_seq);
 	dmirror_do_update(dmirror, range->start, range->end);
 
 	mutex_unlock(&dmirror->mutex);
