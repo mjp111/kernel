@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+/ SPDX-License-Identifier: GPL-2.0
 /*
  * This is a module to test the HMM (Heterogeneous Memory Management)
  * mirror and zone device private memory migration APIs of the kernel.
@@ -267,6 +267,10 @@ static bool dmirror_interval_invalidate(struct mmu_interval_notifier *mni,
 	 */
 	if (range->event == MMU_NOTIFY_MIGRATE &&
 	    range->owner == dmirror->mdevice)
+		return true;
+
+	if (range->event == MMU_NOTIFY_CLEAR &&
+	    range->owner == current)
 		return true;
 
 	if (mmu_notifier_range_blockable(range))
