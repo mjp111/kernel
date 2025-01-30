@@ -965,12 +965,13 @@ int migrate_device_coherent_folio(struct folio *folio)
 	return -EBUSY;
 }
 
-int migrate_hmm_range_setup(struct hmm_range *range)
+void migrate_hmm_range_setup(struct hmm_range *range)
 {
 
 	struct migrate_vma *migrate = range->migrate;
+
 	if (!migrate)
-		return -EINVAL;
+		return;
 
 	migrate->npages = (migrate->end - migrate->start) >> PAGE_SHIFT;
 	migrate->cpages = 0;
@@ -995,7 +996,5 @@ int migrate_hmm_range_setup(struct hmm_range *range)
 		migrate->src[i] |= (range->hmm_pfns[i] & HMM_PFN_WRITE) ? MIGRATE_PFN_WRITE : 0;
 
 	}
-
-	return 0;
 }
 EXPORT_SYMBOL(migrate_hmm_range_setup);
