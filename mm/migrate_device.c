@@ -978,6 +978,9 @@ void migrate_hmm_range_setup(struct hmm_range *range)
 
 	for (unsigned long i = 0; i < migrate->npages; i++) {
 
+		/*
+		  Don't do migration if valid and migrate flags are not both set.
+		*/
 		if ((range->hmm_pfns[i] & (HMM_PFN_VALID | HMM_PFN_MIGRATE)) !=
 		    (HMM_PFN_VALID | HMM_PFN_MIGRATE)) {
 			migrate->src[i] = 0;
@@ -986,6 +989,10 @@ void migrate_hmm_range_setup(struct hmm_range *range)
 
 		migrate->cpages++;
 
+		/*
+		  The zero page is encoded in a special way, valid and migrate is
+		  set, and pfn part is zero. Encode specially for migrate also.
+		*/
 		if (range->hmm_pfns[i] == (HMM_PFN_VALID|HMM_PFN_MIGRATE)) {
 			migrate->src[i] = MIGRATE_PFN_MIGRATE;
 			continue;
