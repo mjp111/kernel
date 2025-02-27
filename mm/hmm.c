@@ -807,9 +807,9 @@ int hmm_range_fault(struct hmm_range *range)
 	} while (ret == -EBUSY);
 
 	if (range->default_flags & HMM_PFN_REQ_MIGRATE && range->migrate) {
-		range->migrate->vma = hmm_vma_walk.vma;
-		range->migrate->start = hmm_vma_walk.start;
-		range->migrate->end = hmm_vma_walk.end;
+		range->migrate->vma   = hmm_vma_walk.vma;
+		range->migrate->start = range->start;
+		range->migrate->end   = hmm_vma_walk.end;
 		mmu_notifier_invalidate_range_end(&hmm_vma_walk.mmu_range);
 	}
 
