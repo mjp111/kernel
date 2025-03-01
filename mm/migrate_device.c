@@ -976,6 +976,7 @@ void migrate_hmm_range_setup(struct hmm_range *range)
 	migrate->npages = (migrate->end - migrate->start) >> PAGE_SHIFT;
 	migrate->cpages = 0;
 
+	printk("requesting hmm range setup for %lu pages\n", migrate->npages);
 	for (unsigned long i = 0; i < migrate->npages; i++) {
 
 		/*
@@ -1001,7 +1002,13 @@ void migrate_hmm_range_setup(struct hmm_range *range)
 		migrate->src[i] = migrate_pfn(page_to_pfn(hmm_pfn_to_page(range->hmm_pfns[i])))
 			| MIGRATE_PFN_MIGRATE;
 		migrate->src[i] |= (range->hmm_pfns[i] & HMM_PFN_WRITE) ? MIGRATE_PFN_WRITE : 0;
+		printk("  mjp - migrate setup pfn %lx\n", page_to_pfn(migrate_pfn_to_page(migrate->src[i])));
 
 	}
+	printk("hmm range setup completed for %lu pages\n", migrate->cpages);
+
+	if (migrate->cpages)
+		migrate_vma_unmap(migrate);
+
 }
 EXPORT_SYMBOL(migrate_hmm_range_setup);

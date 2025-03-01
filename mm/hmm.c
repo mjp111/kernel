@@ -411,6 +411,8 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 		folio_remove_rmap_pte(folio, page, walk->vma);
 		folio_put(folio);
 		*hmm_pfn |= pfn | HMM_PFN_MIGRATE;
+		printk("mjp - migrating system pfn %lx\n", pfn);
+		flush_tlb_range(walk->vma, addr, addr + PAGE_SIZE);
 	} else
 		folio_put(folio);
 out:
