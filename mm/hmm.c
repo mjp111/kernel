@@ -411,7 +411,8 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 		folio_remove_rmap_pte(folio, page, walk->vma);
 		folio_put(folio);
 		*hmm_pfn |= pfn | HMM_PFN_MIGRATE;
-	}
+	} else
+		folio_put(folio);
 out:
 	pte_unmap_unlock(ptep, ptl);
 
