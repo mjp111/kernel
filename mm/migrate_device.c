@@ -225,9 +225,18 @@ static void migrate_vma_unmap(struct migrate_vma *migrate)
  */
 int migrate_vma_setup(struct migrate_vma *args)
 {
-	struct hmm_range range;
 	int ret;
 	long nr_pages = (args->end - args->start) >> PAGE_SHIFT;
+	struct hmm_range range = {
+		.notifier = NULL,
+		.start = args->start,
+		.end = args->end,
+		.migrate = args,
+		.hmm_pfns = args->src,
+		.default_flags = HMM_PFN_REQ_MIGRATE,
+		.dev_private_owner = args->pgmap_owner,
+		.migrate = args
+	};
 
 	args->start &= PAGE_MASK;
 	args->end &= PAGE_MASK;
@@ -252,13 +261,11 @@ int migrate_vma_setup(struct migrate_vma *args)
 	args->cpages = 0;
 	args->npages = 0;
 
-	range.default_flags = HMM_PFN_REQ_MIGRATE;
 	if (args->flags & MIGRATE_VMA_FAULT)
 		range.default_flags |= HMM_PFN_REQ_FAULT;
 
-	range.migrate = args;
-	range.hmm_pfns = args->src;
 	ret = hmm_range_fault(&range);
+
 	migrate_hmm_range_setup(&range);
 
 	/*

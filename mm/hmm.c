@@ -892,14 +892,20 @@ int hmm_range_fault(struct hmm_range *range)
 		.range = range,
 		.last = range->start,
 	};
-	struct mm_struct *mm = range->notifier->mm;
+	struct mm_struct *mm;
 	int ret;
 
+	/*
+	  We might be serving a device fault or come from migrate
+	  entry point. For the former we have not resolved the vma
+	  yet, and the latter we don't have a notifier (but have a vma).
+	*/
+	mm = range->notifier ? range->notifier->mm : range->migrate->vma->vm_mm;
 	mmap_assert_locked(mm);
 
 	do {
 		/* If range is no longer valid force retry. */
-		if (mmu_interval_check_retry(range->notifier,
+		if (range->notifier && mmu_interval_check_retry(range->notifier,
 					     range->notifier_seq)) {
 			ret = -EBUSY;
 			break;
@@ -915,11 +921,14 @@ int hmm_range_fault(struct hmm_range *range)
 		 */
 	} while (ret == -EBUSY);
 
-	if (hmm_want_migrate(range) && range->migrate
-		&& hmm_vma_walk.mmu_range.owner) {
-		range->migrate->vma   = hmm_vma_walk.vma;
-		range->migrate->start = range->start;
-		range->migrate->end   = hmm_vma_walk.end;
+	if (hmm_want_migrate(range) && range->migrate &&
+	    hmm_vma_walk.mmu_range.owner) {
+		// The migrate_vma path has these initialized
+		if (!range->migrate->vma) {
+			range->migrate->vma   = hmm_vma_walk.vma;
+			range->migrate->start = range->start;
+			range->migrate->end   = hmm_vma_walk.end;
+		}
 		mmu_notifier_invalidate_range_end(&hmm_vma_walk.mmu_range);
 	}
 
