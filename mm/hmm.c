@@ -373,8 +373,9 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 	swp_entry_t entry;
 	pte_t pte, swp_pte;
 	spinlock_t *ptl;
-	bool writable;
+	bool writable = false;
 	pte_t *ptep;
+
 
 	// Do we want to migrate at all?
 	minfo = hmm_want_migrate(range);
@@ -413,6 +414,11 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 		// We have already checked that are the pgmap owners
 		if (!(minfo & MIGRATE_VMA_SELECT_DEVICE_PRIVATE))
 			goto out;
+
+		page = pfn_swap_entry_to_page(entry);
+		pfn = page_to_pfn(page);
+		if (is_writable_device_private_entry(entry))
+			writable = true;
 	} else {
 		pfn = pte_pfn(pte);
 		if (is_zero_pfn(pfn) &&
@@ -432,6 +438,7 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 			    pgmap->owner != migrate->pgmap_owner)
 				goto out;
 		}
+		writable = pte_write(pte);
 	}
 
 	/* FIXME support THP */
@@ -482,8 +489,6 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 			pte = ptep_get_and_clear(mm, addr, ptep);
 		}
 
-		writable = pte_write(pte);
-
 		/* Setup special migration page table entry */
 		if (writable)
 			entry = make_writable_migration_entry(pfn);
@@ -509,6 +514,7 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 		folio_remove_rmap_pte(folio, page, walk->vma);
 		folio_put(folio);
 		*hmm_pfn |= HMM_PFN_MIGRATE;
+
 		if (pte_present(pte))
 			flush_tlb_range(walk->vma, addr, addr + PAGE_SIZE);
 	} else
@@ -634,6 +640,7 @@ again:
 			/* Split not successful, skip */
 			return hmm_pfns_fill(start, end, hmm_vma_walk, HMM_PFN_ERROR);
 		}
+
 		/* Split successful or "again", reloop */
 		hmm_vma_walk->last = addr;
 		return -EBUSY;
@@ -892,6 +899,7 @@ int hmm_range_fault(struct hmm_range *range)
 		.range = range,
 		.last = range->start,
 	};
+	bool is_fault_path = !!range->notifier;
 	struct mm_struct *mm;
 	int ret;
 
@@ -900,12 +908,12 @@ int hmm_range_fault(struct hmm_range *range)
 	  entry point. For the former we have not resolved the vma
 	  yet, and the latter we don't have a notifier (but have a vma).
 	*/
-	mm = range->notifier ? range->notifier->mm : range->migrate->vma->vm_mm;
+	mm = is_fault_path ? range->notifier->mm : range->migrate->vma->vm_mm;
 	mmap_assert_locked(mm);
 
 	do {
 		/* If range is no longer valid force retry. */
-		if (range->notifier && mmu_interval_check_retry(range->notifier,
+		if (is_fault_path && mmu_interval_check_retry(range->notifier,
 					     range->notifier_seq)) {
 			ret = -EBUSY;
 			break;
@@ -923,8 +931,8 @@ int hmm_range_fault(struct hmm_range *range)
 
 	if (hmm_want_migrate(range) && range->migrate &&
 	    hmm_vma_walk.mmu_range.owner) {
-		// The migrate_vma path has these initialized
-		if (!range->migrate->vma) {
+		// The migrate_vma path has the following initialized
+		if (is_fault_path) {
 			range->migrate->vma   = hmm_vma_walk.vma;
 			range->migrate->start = range->start;
 			range->migrate->end   = hmm_vma_walk.end;

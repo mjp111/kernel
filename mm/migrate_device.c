@@ -739,6 +739,7 @@ void migrate_hmm_range_setup(struct hmm_range *range)
 		if ((pfn & (HMM_PFN_VALID | HMM_PFN_MIGRATE)) !=
 		    (HMM_PFN_VALID | HMM_PFN_MIGRATE)) {
 			migrate->src[i] = 0;
+			migrate->dst[i] = 0;
 			continue;
 		}
 
