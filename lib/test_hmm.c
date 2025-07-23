@@ -1044,7 +1044,6 @@ static int dmirror_fault_and_migrate_to_device(struct dmirror *dmirror,
 {
 	unsigned long start, size, end, next;
 	unsigned long src_pfns[PFNS_ARRAY_SIZE] = { 0 };
-	unsigned long src2_pfns[PFNS_ARRAY_SIZE] = { 0 };
 	unsigned long dst_pfns[PFNS_ARRAY_SIZE] = { 0 };
 	struct migrate_vma migrate = { 0 };
 	struct hmm_range range = { 0 };
@@ -1066,16 +1065,13 @@ static int dmirror_fault_and_migrate_to_device(struct dmirror *dmirror,
 	migrate.dst = dst_pfns;
 
 	range.migrate = &migrate;
-	range.hmm_pfns = src2_pfns;
+	range.hmm_pfns = src_pfns;
 	range.pfn_flags_mask = 0;
 	range.default_flags = HMM_PFN_REQ_FAULT | HMM_PFN_REQ_MIGRATE;
 	range.dev_private_owner = dmirror->mdevice;
 	range.notifier = &dmirror->notifier;
 
 	for (next = start; next < end; next = range.end) {
-		memset(src_pfns, 0, sizeof(long) * PFNS_ARRAY_SIZE);
-		memset(src2_pfns, 0, sizeof(long) * PFNS_ARRAY_SIZE);
-		memset(dst_pfns, 0, sizeof(long) * PFNS_ARRAY_SIZE);
 		range.start = next;
 		range.end = min(end, next + (PFNS_ARRAY_SIZE << PAGE_SHIFT));
 
