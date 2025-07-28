@@ -660,7 +660,7 @@ again:
 		if (!pmd_trans_huge(pmd))
 			goto again;
 
-		return  hmm_vma_handle_pmd(walk, addr, end, hmm_pfns, pmd);
+		return hmm_vma_handle_pmd(walk, addr, end, hmm_pfns, pmd);
 	}
 
 	/*
