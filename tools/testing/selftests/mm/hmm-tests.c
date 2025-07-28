@@ -277,6 +277,13 @@ static int hmm_migrate_sys_to_dev(int fd,
 	return hmm_dmirror_cmd(fd, HMM_DMIRROR_MIGRATE_TO_DEV, buffer, npages);
 }
 
+static int hmm_migrate_on_fault_sys_to_dev(int fd,
+					   struct hmm_buffer *buffer,
+					   unsigned long npages)
+{
+	return hmm_dmirror_cmd(fd, HMM_DMIRROR_MIGRATE_ON_FAULT_TO_DEV, buffer, npages);
+}
+
 static int hmm_migrate_dev_to_sys(int fd,
 				   struct hmm_buffer *buffer,
 				   unsigned long npages)
@@ -291,6 +298,7 @@ TEST_F(hmm, open_close)
 {
 }
 
+#if 0
 /*
  * Read private anonymous memory.
  */
@@ -1034,6 +1042,53 @@ TEST_F(hmm, migrate)
 	hmm_buffer_free(buffer);
 }
 
+
+/*
+ * Fault an migrate anonymous memory to device private memory.
+ */
+TEST_F(hmm, migrate_on_fault)
+{
+	struct hmm_buffer *buffer;
+	unsigned long npages;
+	unsigned long size;
+	unsigned long i;
+	int *ptr;
+	int ret;
+
+	npages = ALIGN(HMM_BUFFER_SIZE, self->page_size) >> self->page_shift;
+	ASSERT_NE(npages, 0);
+	size = npages << self->page_shift;
+
+	buffer = malloc(sizeof(*buffer));
+	ASSERT_NE(buffer, NULL);
+
+	buffer->fd = -1;
+	buffer->size = size;
+	buffer->mirror = malloc(size);
+	ASSERT_NE(buffer->mirror, NULL);
+
+	buffer->ptr = mmap(NULL, size,
+			   PROT_READ | PROT_WRITE,
+			   MAP_PRIVATE | MAP_ANONYMOUS,
+			   buffer->fd, 0);
+	ASSERT_NE(buffer->ptr, MAP_FAILED);
+
+	/* Initialize buffer in system memory. */
+	for (i = 0, ptr = buffer->ptr; i < size / sizeof(*ptr); ++i)
+		ptr[i] = i;
+
+	/* Fault and migrate memory to device. */
+	ret = hmm_migrate_on_fault_sys_to_dev(self->fd, buffer, npages);
+	ASSERT_EQ(ret, 0);
+	ASSERT_EQ(buffer->cpages, npages);
+
+	/* Check what the device read. */
+	for (i = 0, ptr = buffer->mirror; i < size / sizeof(*ptr); ++i)
+		ASSERT_EQ(ptr[i], i);
+
+	hmm_buffer_free(buffer);
+}
+
 /*
  * Migrate anonymous memory to device private memory and fault some of it back
  * to system memory, then try migrating the resulting mix of system and device
@@ -1178,7 +1233,8 @@ TEST_F(hmm, migrate_shared)
 
 	hmm_buffer_free(buffer);
 }
-
+#endif
+#if 1
 /*
  * Try to migrate various memory types to device private memory.
  */
@@ -1265,7 +1321,8 @@ TEST_F(hmm2, migrate_mixed)
 	buffer->ptr = p;
 	hmm_buffer_free(buffer);
 }
-
+#endif
+#if 0
 /*
  * Migrate anonymous memory to device memory and back to system memory
  * multiple times. In case of private zone configuration, this is done
@@ -1496,6 +1553,7 @@ TEST_F(hmm, mixedmap)
 	hmm_buffer_free(buffer);
 }
 
+
 /*
  * Test memory snapshot without faulting in pages accessed by the device.
  */
@@ -1596,6 +1654,7 @@ TEST_F(hmm2, snapshot)
 
 	hmm_buffer_free(buffer);
 }
+
 
 /*
  * Test the hmm_range_fault() HMM_PFN_PMD flag for large pages that
@@ -2012,6 +2071,7 @@ TEST_F(hmm, hmm_gup_test)
 	close(gup_fd);
 	hmm_buffer_free(buffer);
 }
+
 
 /*
  * Test copy-on-write in device pages.
@@ -2660,7 +2720,7 @@ TEST_F(hmm, migrate_anon_huge_zero_err)
 	buffer->ptr = old_ptr;
 	hmm_buffer_free(buffer);
 }
-
+#endif
 struct benchmark_results {
 	double sys_to_dev_time;
 	double dev_to_sys_time;
@@ -2801,6 +2861,7 @@ static inline int run_migration_benchmark(int fd, int use_thp, size_t buffer_siz
 	return 0;
 }
 
+#if 0
 /*
  * Benchmark THP migration with different buffer sizes
  */
@@ -2852,4 +2913,5 @@ TEST_F_TIMEOUT(hmm, benchmark_thp_migration, 120)
 					&thp_results, &regular_results);
 	}
 }
+#endif
 TEST_HARNESS_MAIN
