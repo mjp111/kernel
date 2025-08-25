@@ -52,7 +52,7 @@ enum {
 			      HMM_PFN_P2PDMA_BUS,
 };
 
-static enum migrate_vma_info hmm_want_migrate(struct hmm_range *range)
+static enum migrate_vma_info hmm_select_migrate(struct hmm_range *range)
 {
 	enum migrate_vma_info minfo;
 
@@ -70,7 +70,7 @@ static int hmm_pfns_fill(unsigned long addr, unsigned long end,
 	unsigned long i = (addr - range->start) >> PAGE_SHIFT;
 
 	if (cpu_flags != HMM_PFN_ERROR)
-		if (hmm_want_migrate(range) &&
+		if (hmm_select_migrate(range) &&
 		    (vma_is_anonymous(hmm_vma_walk->vma)))
 			cpu_flags |= (HMM_PFN_VALID | HMM_PFN_MIGRATE);
 
@@ -307,7 +307,7 @@ static int hmm_vma_handle_pte(struct mm_walk *walk, unsigned long addr,
 			goto fault;
 
 		if (is_migration_entry(entry)) {
-			if (!hmm_want_migrate(range)) {
+			if (!hmm_select_migrate(range)) {
 				pte_unmap(ptep);
 				hmm_vma_walk->last = addr;
 				migration_entry_wait(walk->mm, pmdp, addr);
@@ -443,7 +443,7 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 
 
 	// Do we want to migrate at all?
-	minfo = hmm_want_migrate(range);
+	minfo = hmm_select_migrate(range);
 	if (!minfo)
 		return;
 
@@ -642,7 +642,7 @@ static int hmm_vma_capture_migrate_range(unsigned long start,
 	struct hmm_vma_walk *hmm_vma_walk = walk->private;
 	struct hmm_range *range = hmm_vma_walk->range;
 
-	if (!hmm_want_migrate(range))
+	if (!hmm_select_migrate(range))
 		return 0;
 
 	if (hmm_vma_walk->vma && (hmm_vma_walk->vma != walk->vma))
@@ -681,14 +681,14 @@ static int hmm_vma_walk_pmd(pmd_t *pmdp,
 	pmd_t pmd;
 	int r;
 
-	minfo = hmm_want_migrate(range);
+	minfo = hmm_select_migrate(range);
 again:
 	pmd = pmdp_get_lockless(pmdp);
 	if (pmd_none(pmd))
 		return hmm_vma_walk_hole(start, end, -1, walk);
 
 	if (thp_migration_supported() && is_pmd_migration_entry(pmd) &&
-	    !hmm_want_migrate(range)) {
+	    !hmm_select_migrate(range)) {
 		if (hmm_range_need_fault(hmm_vma_walk, hmm_pfns, npages, 0)) {
 			hmm_vma_walk->last = addr;
 			pmd_migration_entry_wait(walk->mm, pmdp);
@@ -704,15 +704,14 @@ again:
 		if (r || !minfo)
 			return r;
 	}
-	
+
 	if (!pmd_present(pmd)) {
 		if (hmm_range_need_fault(hmm_vma_walk, hmm_pfns, npages, 0))
 			return -EFAULT;
 		return hmm_pfns_fill(start, end, hmm_vma_walk, HMM_PFN_ERROR);
 	}
 
-	if (minfo &&
-	    pmd_trans_huge(pmd)) {
+	if (minfo && pmd_trans_huge(pmd)) {
 		int r;
 
 		r = hmm_vma_walk_split(pmdp, addr, walk);
@@ -1011,7 +1010,7 @@ int hmm_range_fault(struct hmm_range *range)
 		 */
 	} while (ret == -EBUSY);
 
-	if (hmm_want_migrate(range) && range->migrate &&
+	if (hmm_select_migrate(range) && range->migrate &&
 	    hmm_vma_walk.mmu_range.owner) {
 		// The migrate_vma path has the following initialized
 		if (is_fault_path) {
