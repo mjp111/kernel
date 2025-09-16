@@ -50,7 +50,8 @@ enum hmm_pfn_flags {
 
 	/* Migrate request */
 	HMM_PFN_MIGRATE    = 1UL << (BITS_PER_LONG - 7),
-	HMM_PFN_ORDER_SHIFT = (BITS_PER_LONG - 12),
+	HMM_PFN_COMPOUND   = 1UL << (BITS_PER_LONG - 8),
+	HMM_PFN_ORDER_SHIFT = (BITS_PER_LONG - 13),
 
 	/* Input flags */
 	HMM_PFN_REQ_FAULT = HMM_PFN_VALID,
@@ -58,6 +59,12 @@ enum hmm_pfn_flags {
 	HMM_PFN_REQ_MIGRATE = HMM_PFN_MIGRATE,
 
 	HMM_PFN_FLAGS = ~((1UL << HMM_PFN_ORDER_SHIFT) - 1),
+};
+
+enum {
+        /* These flags are carried from input-to-output */
+        HMM_PFN_INOUT_FLAGS = HMM_PFN_DMA_MAPPED | HMM_PFN_P2PDMA |
+                              HMM_PFN_P2PDMA_BUS,
 };
 
 /*

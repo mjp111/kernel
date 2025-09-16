@@ -46,12 +46,6 @@ enum {
 	HMM_NEED_ALL_BITS = HMM_NEED_FAULT | HMM_NEED_WRITE_FAULT,
 };
 
-enum {
-	/* These flags are carried from input-to-output */
-	HMM_PFN_INOUT_FLAGS = HMM_PFN_DMA_MAPPED | HMM_PFN_P2PDMA |
-			      HMM_PFN_P2PDMA_BUS,
-};
-
 static enum migrate_vma_info hmm_select_migrate(struct hmm_range *range)
 {
 	enum migrate_vma_info minfo;
@@ -397,7 +391,7 @@ static int hmm_vma_handle_absent_pmd(struct mm_walk *walk, unsigned long start,
 			return -EFAULT;
 	}
 
-	return hmm_pfns_fill(start, end, range, HMM_PFN_ERROR);
+	return hmm_pfns_fill(start, end, hmm_vma_walk, HMM_PFN_ERROR);
 }
 #else
 static int hmm_vma_handle_absent_pmd(struct mm_walk *walk, unsigned long start,
@@ -410,9 +404,188 @@ static int hmm_vma_handle_absent_pmd(struct mm_walk *walk, unsigned long start,
 
 	if (hmm_range_need_fault(hmm_vma_walk, hmm_pfns, npages, 0))
 		return -EFAULT;
-	return hmm_pfns_fill(start, end, range, HMM_PFN_ERROR);
+	return hmm_pfns_fill(start, end, hmm_vma_walk, HMM_PFN_ERROR);
 }
 #endif  /* CONFIG_ARCH_ENABLE_THP_MIGRATION */
+
+/**
+ * migrate_vma_split_folio() - Helper function to split a THP folio
+ * @folio: the folio to split
+ * @fault_page: struct page associated with the fault if any
+ *
+ * Returns 0 on success
+ */
+static int migrate_vma_split_folio(struct folio *folio,
+                                   struct page *fault_page)
+{
+        int ret;
+        struct folio *fault_folio = fault_page ? page_folio(fault_page) : NULL;
+        struct folio *new_fault_folio = NULL;
+
+        if (folio != fault_folio) {
+                folio_get(folio);
+                folio_lock(folio);
+        }
+
+        ret = split_folio(folio);
+        if (ret) {
+                if (folio != fault_folio) {
+                        folio_unlock(folio);
+                        folio_put(folio);
+                }
+                return ret;
+        }
+
+        new_fault_folio = fault_page ? page_folio(fault_page) : NULL;
+
+        /*
+         * Ensure the lock is held on the correct
+         * folio after the split
+         */
+        if (!new_fault_folio) {
+                folio_unlock(folio);
+                folio_put(folio);
+        } else if (folio != new_fault_folio) {
+                folio_get(new_fault_folio);
+                folio_lock(new_fault_folio);
+                folio_unlock(folio);
+                folio_put(folio);
+        }
+
+        return 0;
+}
+static int hmm_vma_migrate_hole(const struct mm_walk *walk,
+				       unsigned long start,
+				       unsigned long end)
+
+{
+	struct hmm_vma_walk *hmm_vma_walk = walk->private;
+	struct hmm_range *range = hmm_vma_walk->range;
+	enum migrate_vma_info minfo;
+	unsigned long addr, i;
+	int ret = 0;
+
+//mjp
+	minfo = hmm_select_migrate(range);
+        if (minfo) {
+		i = (start - range->start) >> PAGE_SHIFT;
+		if (thp_migration_supported() &&
+		    (minfo & MIGRATE_VMA_SELECT_COMPOUND) &&
+		    IS_ALIGNED(start, HPAGE_PMD_SIZE) &&
+		    IS_ALIGNED(end, HPAGE_PMD_SIZE)) {
+			range->hmm_pfns[i] |= HMM_PFN_MIGRATE | HMM_PFN_COMPOUND | HMM_PFN_VALID;
+			return hmm_pfns_fill(start + PAGE_SIZE, end, hmm_vma_walk, 0);
+		}
+
+		for (addr = start; addr < end; addr += PAGE_SIZE, i++) {
+			range->hmm_pfns[i] &= HMM_PFN_INOUT_FLAGS;
+			range->hmm_pfns[i] |= HMM_PFN_MIGRATE | HMM_PFN_VALID;
+		}
+	}
+
+	return ret;
+}
+
+static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
+					      pmd_t *pmdp,
+					      unsigned long start,
+					      unsigned long end,
+					      unsigned long *hmm_pfn)
+{
+	struct hmm_vma_walk *hmm_vma_walk = walk->private;
+	struct hmm_range *range = hmm_vma_walk->range;
+	struct migrate_vma *migrate = range->migrate;
+	struct mm_struct *mm = walk->vma->vm_mm;
+	struct folio *fault_folio = NULL;
+	struct folio *folio;
+	swp_entry_t entry;
+	enum migrate_vma_info minfo;
+	spinlock_t *ptl;
+	unsigned long i = (start - range->start) >> PAGE_SHIFT;
+	int r = 0;
+
+	minfo = hmm_select_migrate(range);
+	if (!minfo)
+		return r;
+
+	fault_folio = (migrate && migrate->fault_page) ?
+		page_folio(migrate->fault_page) : NULL;
+
+	ptl = pmd_lock(mm, pmdp);
+        if (pmd_none(*pmdp)) {
+                spin_unlock(ptl);
+                return hmm_vma_migrate_hole(walk, start, end);
+        }
+
+	if (!(range->hmm_pfns[i] & HMM_PFN_VALID))
+		goto out;
+
+        if (pmd_trans_huge(*pmdp)) {
+                if (!(minfo & MIGRATE_VMA_SELECT_SYSTEM))
+			goto out;
+
+                folio = pmd_folio(*pmdp);
+                if (is_huge_zero_folio(folio)) {
+                        spin_unlock(ptl);
+                        return hmm_vma_migrate_hole(walk, start, end);
+                }
+
+	} else if (!pmd_present(*pmdp)) {
+		entry = pmd_to_swp_entry(*pmdp);
+                folio = pfn_swap_entry_folio(entry);
+		if (!is_device_private_entry(entry))
+			goto out;
+
+		// We have already checked that are the pgmap owners
+		if (!(minfo & MIGRATE_VMA_SELECT_DEVICE_PRIVATE))
+			goto out;
+
+	} else {
+		spin_unlock(ptl);
+                return -EBUSY;
+	}
+
+       folio_get(folio);
+
+       if (folio != fault_folio && unlikely(!folio_trylock(folio))) {
+                spin_unlock(ptl);
+                folio_put(folio);
+                return 0;  //mjp
+        }
+
+       if (thp_migration_supported() &&
+	   (migrate->flags & MIGRATE_VMA_SELECT_COMPOUND) &&
+	   (IS_ALIGNED(start, HPAGE_PMD_SIZE) &&
+	    IS_ALIGNED(end, HPAGE_PMD_SIZE))) {
+
+	       struct page_vma_mapped_walk pvmw = {
+		       .ptl = ptl,
+		       .address = start,
+		       .pmd = pmdp,
+		       .vma = walk->vma,
+	       };
+
+	       i = (start - range->start) >> PAGE_SHIFT;
+	       range->hmm_pfns[i] |= HMM_PFN_MIGRATE | HMM_PFN_COMPOUND;
+	       r =  hmm_pfns_fill(start + PAGE_SIZE, end, hmm_vma_walk, 0);
+	       if (r)
+		       goto out;
+
+	       r = set_pmd_migration_entry(&pvmw, folio_page(folio, 0));
+	       if (r) {
+		       range->hmm_pfns[i] &= ~(HMM_PFN_MIGRATE | HMM_PFN_COMPOUND);
+		       r = -ENOENT;  // fallback
+		       goto out;
+	       }
+	       r =  hmm_pfns_fill(start + PAGE_SIZE, end, hmm_vma_walk, 0);
+       } else
+	       r = -ENOENT;  // fallback
+
+
+out:
+       spin_unlock(ptl);
+       return r;
+}
 
 /*
  * Install migration entries if migration requested, either from fault
@@ -450,6 +623,7 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 	fault_folio = (migrate && migrate->fault_page) ?
 		page_folio(migrate->fault_page) : NULL;
 
+again:
 	ptep = pte_offset_map_lock(mm, pmdp, addr, &ptl);
 	if (!ptep)
 		return;
@@ -458,9 +632,11 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 
 	if (pte_none(pte)) {
 		// migrate without faulting case
-		if (vma_is_anonymous(walk->vma))
-			*hmm_pfn = HMM_PFN_MIGRATE|HMM_PFN_VALID;
-		goto out;
+		if (vma_is_anonymous(walk->vma)) {
+			*hmm_pfn &= HMM_PFN_INOUT_FLAGS;
+			*hmm_pfn |= HMM_PFN_MIGRATE | HMM_PFN_VALID;
+			goto out;
+		}
 	}
 
 	if (!(*hmm_pfn & HMM_PFN_VALID))
@@ -481,6 +657,18 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 			goto out;
 
 		page = pfn_swap_entry_to_page(entry);
+		folio = page_folio(page);
+		if (folio_test_large(folio)) {
+			int ret;
+
+			pte_unmap_unlock(ptep, ptl);
+			ret = migrate_vma_split_folio(folio,
+						      migrate->fault_page);
+			if (ret)
+				goto out_unlocked;
+			goto again;
+		}
+
 		pfn = page_to_pfn(page);
 		if (is_writable_device_private_entry(entry))
 			writable = true;
@@ -503,6 +691,20 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 			    pgmap->owner != migrate->pgmap_owner)
 				goto out;
 		}
+
+		folio = page_folio(page);
+		if (folio_test_large(folio)) {
+			int ret;
+
+			pte_unmap_unlock(ptep, ptl);
+			ret = migrate_vma_split_folio(folio,
+						      migrate->fault_page);
+			if (ret)
+				goto out_unlocked;
+
+			goto again;
+		}
+
 		writable = pte_write(pte);
 	}
 
@@ -586,6 +788,7 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 		folio_put(folio);
 out:
 	pte_unmap_unlock(ptep, ptl);
+	out_unlocked:
 
 }
 
@@ -676,41 +879,35 @@ static int hmm_vma_walk_pmd(pmd_t *pmdp,
 		&range->hmm_pfns[(start - range->start) >> PAGE_SHIFT];
 	unsigned long npages = (end - start) >> PAGE_SHIFT;
 	unsigned long addr = start;
+	enum migrate_vma_info minfo;
+	unsigned long i;
 	pte_t *ptep;
 	pmd_t pmd;
+	int r;
 
+	minfo = hmm_select_migrate(range);
 again:
 	pmd = pmdp_get_lockless(pmdp);
 	if (pmd_none(pmd))
 		return hmm_vma_walk_hole(start, end, -1, walk);
 
-	if (thp_migration_supported() && is_pmd_migration_entry(pmd) &&
-	    !hmm_select_migrate(range)) {
-		if (hmm_range_need_fault(hmm_vma_walk, hmm_pfns, npages, 0)) {
-			hmm_vma_walk->last = addr;
-			pmd_migration_entry_wait(walk->mm, pmdp);
-			return -EBUSY;
+	if (thp_migration_supported() && is_pmd_migration_entry(pmd)) {
+		if (!minfo) {
+			if (hmm_range_need_fault(hmm_vma_walk, hmm_pfns, npages, 0)) {
+				hmm_vma_walk->last = addr;
+				pmd_migration_entry_wait(walk->mm, pmdp);
+				return -EBUSY;
+			}
 		}
-		return hmm_pfns_fill(start, end, hmm_vma_walk, 0);
+		for (i = 0; addr < end; addr += PAGE_SIZE, hmm_pfns++)
+			range->hmm_pfns[i] &= HMM_PFN_INOUT_FLAGS;
 	}
 
-	if (!pmd_present(pmd))
-		return hmm_vma_handle_absent_pmd(walk, start, end, hmm_pfns,
-						 pmd);
-
-	if (hmm_select_migrate(range) &&
-	    pmd_trans_huge(pmd)) {
-		int r;
-
-		r = hmm_vma_walk_split(pmdp, addr, walk);
-		if (r) {
-			/* Split not successful, skip */
-			return hmm_pfns_fill(start, end, hmm_vma_walk, HMM_PFN_ERROR);
-		}
-
-		/* Split successful or "again", reloop */
-		hmm_vma_walk->last = addr;
-		return -EBUSY;
+	if (!pmd_present(pmd)) {
+		r =  hmm_vma_handle_absent_pmd(walk, start, end, hmm_pfns,
+					       pmd);
+		if (r || !minfo)
+			return r;
 	}
 
 	if (pmd_trans_huge(pmd)) {
@@ -727,8 +924,34 @@ again:
 		if (!pmd_trans_huge(pmd))
 			goto again;
 
-		return hmm_vma_handle_pmd(walk, addr, end, hmm_pfns, pmd);
+		r = hmm_vma_handle_pmd(walk, addr, end, hmm_pfns, pmd);
+
+		if (r || !minfo)
+			return r;
 	}
+
+
+       // mjp
+
+	r = hmm_vma_handle_migrate_prepare_pmd(walk, pmdp, start, end, hmm_pfns);
+
+	// retry?
+	if (r == -EBUSY)
+		return r;
+
+	if (r == -ENOENT && minfo && pmd_trans_huge(pmd)) {
+
+		r = hmm_vma_walk_split(pmdp, addr, walk);
+		if (r) {
+			/* Split not successful, skip */
+			return hmm_pfns_fill(start, end, hmm_vma_walk, HMM_PFN_ERROR);
+		}
+
+		/* Split successful or "again", reloop */
+		hmm_vma_walk->last = addr;
+		return -EBUSY;
+	}
+
 
 	/*
 	 * We have handled all the valid cases above ie either none, migration,
@@ -746,7 +969,6 @@ again:
 	if (!ptep)
 		goto again;
 	for (; addr < end; addr += PAGE_SIZE, ptep++, hmm_pfns++) {
-		int r;
 
 		r = hmm_vma_handle_pte(walk, addr, end, pmdp, ptep, hmm_pfns);
 		if (r) {

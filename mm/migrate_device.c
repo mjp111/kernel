@@ -18,6 +18,7 @@
 #include <asm/tlbflush.h>
 #include "internal.h"
 
+#if 0
 static int migrate_vma_collect_skip(unsigned long start,
 				    unsigned long end,
 				    struct mm_walk *walk)
@@ -518,7 +519,7 @@ static void migrate_vma_collect(struct migrate_vma *migrate)
 	mmu_notifier_invalidate_range_end(&range);
 	migrate->end = migrate->start + (migrate->npages << PAGE_SHIFT);
 }
-
+#endif
 /*
  * migrate_vma_check_page() - check if page is pinned or not
  * @page: struct page to check
@@ -1511,6 +1512,7 @@ void migrate_hmm_range_setup(struct hmm_range *range)
 	for (unsigned long i = 0; i < migrate->npages; i++) {
 
 		unsigned long pfn = range->hmm_pfns[i];
+		pfn &= ~HMM_PFN_INOUT_FLAGS;
 
 		/*
 		 *
@@ -1540,6 +1542,7 @@ void migrate_hmm_range_setup(struct hmm_range *range)
 		migrate->src[i] = migrate_pfn(page_to_pfn(hmm_pfn_to_page(pfn)))
 			| MIGRATE_PFN_MIGRATE;
 		migrate->src[i] |= (pfn & HMM_PFN_WRITE) ? MIGRATE_PFN_WRITE : 0;
+		migrate->src[i] |= (pfn & HMM_PFN_COMPOUND) ? MIGRATE_PFN_COMPOUND : 0;
 	}
 
 	if (migrate->cpages)
