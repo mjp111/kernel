@@ -935,10 +935,7 @@ again:
 
 	r = hmm_vma_handle_migrate_prepare_pmd(walk, pmdp, start, end, hmm_pfns);
 
-	// retry?
-	if (r == -EBUSY)
-		return r;
-
+	// fallback to migrate at pte level ?
 	if (r == -ENOENT && minfo && pmd_trans_huge(pmd)) {
 
 		r = hmm_vma_walk_split(pmdp, addr, walk);
@@ -952,6 +949,9 @@ again:
 		return -EBUSY;
 	}
 
+
+	if (r || minfo)
+		return r;
 
 	/*
 	 * We have handled all the valid cases above ie either none, migration,
