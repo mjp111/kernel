@@ -62,11 +62,27 @@ static int hmm_pfns_fill(unsigned long addr, unsigned long end,
 {
 	struct hmm_range *range = hmm_vma_walk->range;
 	unsigned long i = (addr - range->start) >> PAGE_SHIFT;
+	enum migrate_vma_info minfo;
 
-	if (cpu_flags != HMM_PFN_ERROR)
+	bool migrate = false;
+
+	if (cpu_flags != HMM_PFN_ERROR) {
 		if (hmm_select_migrate(range) &&
-		    (vma_is_anonymous(hmm_vma_walk->vma)))
+		    (vma_is_anonymous(hmm_vma_walk->vma))) {
 			cpu_flags |= (HMM_PFN_VALID | HMM_PFN_MIGRATE);
+			migrate = true;
+		}
+	}
+
+	if (migrate && thp_migration_supported() &&
+	    (minfo & MIGRATE_VMA_SELECT_COMPOUND) &&
+	    IS_ALIGNED(addr, HPAGE_PMD_SIZE) &&
+	    IS_ALIGNED(end, HPAGE_PMD_SIZE)) {
+		range->hmm_pfns[i] &= HMM_PFN_INOUT_FLAGS;
+		range->hmm_pfns[i] |= cpu_flags | HMM_PFN_COMPOUND;
+		addr += PAGE_SIZE;
+		i++;
+	}
 
 	for (; addr < end; addr += PAGE_SIZE, i++) {
 		range->hmm_pfns[i] &= HMM_PFN_INOUT_FLAGS;
@@ -454,37 +470,6 @@ static int migrate_vma_split_folio(struct folio *folio,
 
         return 0;
 }
-static int hmm_vma_migrate_hole(const struct mm_walk *walk,
-				       unsigned long start,
-				       unsigned long end)
-
-{
-	struct hmm_vma_walk *hmm_vma_walk = walk->private;
-	struct hmm_range *range = hmm_vma_walk->range;
-	enum migrate_vma_info minfo;
-	unsigned long addr, i;
-	int ret = 0;
-
-//mjp
-	minfo = hmm_select_migrate(range);
-        if (minfo) {
-		i = (start - range->start) >> PAGE_SHIFT;
-		if (thp_migration_supported() &&
-		    (minfo & MIGRATE_VMA_SELECT_COMPOUND) &&
-		    IS_ALIGNED(start, HPAGE_PMD_SIZE) &&
-		    IS_ALIGNED(end, HPAGE_PMD_SIZE)) {
-			range->hmm_pfns[i] |= HMM_PFN_MIGRATE | HMM_PFN_COMPOUND | HMM_PFN_VALID;
-			return hmm_pfns_fill(start + PAGE_SIZE, end, hmm_vma_walk, 0);
-		}
-
-		for (addr = start; addr < end; addr += PAGE_SIZE, i++) {
-			range->hmm_pfns[i] &= HMM_PFN_INOUT_FLAGS;
-			range->hmm_pfns[i] |= HMM_PFN_MIGRATE | HMM_PFN_VALID;
-		}
-	}
-
-	return ret;
-}
 
 static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 					      pmd_t *pmdp,
@@ -515,7 +500,7 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 	ptl = pmd_lock(mm, pmdp);
         if (pmd_none(*pmdp)) {
                 spin_unlock(ptl);
-                return hmm_vma_migrate_hole(walk, start, end);
+		return hmm_pfns_fill(start, end, hmm_vma_walk, 0);
         }
 
 	printk("mjp - prepare pmd 1\n");
@@ -530,7 +515,7 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
                 folio = pmd_folio(*pmdp);
                 if (is_huge_zero_folio(folio)) {
                         spin_unlock(ptl);
-                        return hmm_vma_migrate_hole(walk, start, end);
+			return hmm_pfns_fill(start, end, hmm_vma_walk, 0);
                 }
 
 	} else if (!pmd_present(*pmdp)) {
@@ -902,7 +887,7 @@ again:
 		ptl = pmd_lock(mm, pmdp);
 		if (pmd_none(*pmdp)) {
 			spin_unlock(ptl);
-			return hmm_vma_migrate_hole(walk, start, end);
+			return hmm_pfns_fill(start, end, hmm_vma_walk, 0);
 		}
 		splin_unlock(ptl);
 	}
