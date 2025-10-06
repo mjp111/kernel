@@ -504,6 +504,7 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 	unsigned long i = (start - range->start) >> PAGE_SHIFT;
 	int r = 0;
 
+	printk("mjp - prepare pmd\n");
 	minfo = hmm_select_migrate(range);
 	if (!minfo)
 		return r;
@@ -517,9 +518,11 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
                 return hmm_vma_migrate_hole(walk, start, end);
         }
 
+	printk("mjp - prepare pmd 1\n");
 	if (!(range->hmm_pfns[i] & HMM_PFN_VALID))
 		goto out;
 
+	printk("mjp - prepare pmd 2\n");
         if (pmd_trans_huge(*pmdp)) {
                 if (!(minfo & MIGRATE_VMA_SELECT_SYSTEM))
 			goto out;
@@ -539,6 +542,7 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 		// We have already checked that are the pgmap owners
 		if (!(minfo & MIGRATE_VMA_SELECT_DEVICE_PRIVATE))
 			goto out;
+		printk("mjp - migrate big device\n");
 
 	} else {
 		spin_unlock(ptl);
@@ -550,7 +554,7 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
        if (folio != fault_folio && unlikely(!folio_trylock(folio))) {
                 spin_unlock(ptl);
                 folio_put(folio);
-                return 0;  //mjp
+                return -ENOENT;  //mjp
         }
 
        if (thp_migration_supported() &&
@@ -614,7 +618,7 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 	bool writable = false;
 	pte_t *ptep;
 
-
+	printk("mjp -- test\n");
 	// Do we want to migrate at all?
 	minfo = hmm_select_migrate(range);
 	if (!minfo)
@@ -656,6 +660,7 @@ again:
 		if (!(minfo & MIGRATE_VMA_SELECT_DEVICE_PRIVATE))
 			goto out;
 
+		printk("mjp - migrate device\n");
 		page = pfn_swap_entry_to_page(entry);
 		folio = page_folio(page);
 		if (folio_test_large(folio)) {
@@ -881,15 +886,26 @@ static int hmm_vma_walk_pmd(pmd_t *pmdp,
 	unsigned long addr = start;
 	enum migrate_vma_info minfo;
 	unsigned long i;
+	spinlock_t *ptl;
 	pte_t *ptep;
 	pmd_t pmd;
 	int r;
 
+	printk("mjp - walk\n");
 	minfo = hmm_select_migrate(range);
 again:
+
 	pmd = pmdp_get_lockless(pmdp);
-	if (pmd_none(pmd))
-		return hmm_vma_walk_hole(start, end, -1, walk);
+	if (pmd_none(pmd)) {
+		if (!minfo)
+			return hmm_vma_walk_hole(start, end, -1, walk);
+		ptl = pmd_lock(mm, pmdp);
+		if (pmd_none(*pmdp)) {
+			spin_unlock(ptl);
+			return hmm_vma_migrate_hole(walk, start, end);
+		}
+		splin_unlock(ptl);
+	}
 
 	if (thp_migration_supported() && is_pmd_migration_entry(pmd)) {
 		if (!minfo) {
@@ -903,6 +919,7 @@ again:
 			range->hmm_pfns[i] &= HMM_PFN_INOUT_FLAGS;
 	}
 
+	printk("mjp - walk2\n");
 	if (!pmd_present(pmd)) {
 		r =  hmm_vma_handle_absent_pmd(walk, start, end, hmm_pfns,
 					       pmd);
@@ -910,6 +927,7 @@ again:
 			return r;
 	}
 
+	printk("mjp - walk3\n");
 	if (pmd_trans_huge(pmd)) {
 		/*
 		 * No need to take pmd_lock here, even if some other thread
@@ -928,31 +946,26 @@ again:
 
 		if (r || !minfo)
 			return r;
-	}
 
+		r = hmm_vma_handle_migrate_prepare_pmd(walk, pmdp, start, end, hmm_pfns);
 
-       // mjp
+		if (r == -ENOENT) {
+			r = hmm_vma_walk_split(pmdp, addr, walk);
+			if (r) {
+				/* Split not successful, skip */
+				return hmm_pfns_fill(start, end, hmm_vma_walk, HMM_PFN_ERROR);
+			}
 
-	r = hmm_vma_handle_migrate_prepare_pmd(walk, pmdp, start, end, hmm_pfns);
+			/* Split successful or "again", reloop */
+			hmm_vma_walk->last = addr;
+			return -EBUSY;
 
-	// fallback to migrate at pte level ?
-	if (r == -ENOENT && minfo && pmd_trans_huge(pmd)) {
-
-		r = hmm_vma_walk_split(pmdp, addr, walk);
-		if (r) {
-			/* Split not successful, skip */
-			return hmm_pfns_fill(start, end, hmm_vma_walk, HMM_PFN_ERROR);
 		}
-
-		/* Split successful or "again", reloop */
-		hmm_vma_walk->last = addr;
-		return -EBUSY;
+		if (r || minfo)
+			return r;
 	}
 
-
-	if (r || minfo)
-		return r;
-
+	printk("mjp - continue small\n");
 	/*
 	 * We have handled all the valid cases above ie either none, migration,
 	 * huge or transparent huge. At this point either it is a valid pmd

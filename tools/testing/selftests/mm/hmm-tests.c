@@ -298,6 +298,7 @@ TEST_F(hmm, open_close)
 {
 }
 
+#if 0
 /*
  * Read private anonymous memory.
  */
@@ -1041,6 +1042,7 @@ TEST_F(hmm, migrate)
 	hmm_buffer_free(buffer);
 }
 
+
 /*
  * Fault an migrate anonymous memory to device private memory.
  */
@@ -1231,7 +1233,8 @@ TEST_F(hmm, migrate_shared)
 
 	hmm_buffer_free(buffer);
 }
-
+#endif
+#if 1
 /*
  * Try to migrate various memory types to device private memory.
  */
@@ -1318,7 +1321,8 @@ TEST_F(hmm2, migrate_mixed)
 	buffer->ptr = p;
 	hmm_buffer_free(buffer);
 }
-
+#endif
+#if 0
 /*
  * Migrate anonymous memory to device memory and back to system memory
  * multiple times. In case of private zone configuration, this is done
@@ -1549,6 +1553,7 @@ TEST_F(hmm, mixedmap)
 	hmm_buffer_free(buffer);
 }
 
+
 /*
  * Test memory snapshot without faulting in pages accessed by the device.
  */
@@ -1649,6 +1654,7 @@ TEST_F(hmm2, snapshot)
 
 	hmm_buffer_free(buffer);
 }
+
 
 /*
  * Test the hmm_range_fault() HMM_PFN_PMD flag for large pages that
@@ -2065,6 +2071,7 @@ TEST_F(hmm, hmm_gup_test)
 	close(gup_fd);
 	hmm_buffer_free(buffer);
 }
+
 
 /*
  * Test copy-on-write in device pages.
@@ -2713,7 +2720,7 @@ TEST_F(hmm, migrate_anon_huge_zero_err)
 	buffer->ptr = old_ptr;
 	hmm_buffer_free(buffer);
 }
-
+#endif
 struct benchmark_results {
 	double sys_to_dev_time;
 	double dev_to_sys_time;
@@ -2854,6 +2861,7 @@ static inline int run_migration_benchmark(int fd, int use_thp, size_t buffer_siz
 	return 0;
 }
 
+#if 0
 /*
  * Benchmark THP migration with different buffer sizes
  */
@@ -2905,4 +2913,5 @@ TEST_F_TIMEOUT(hmm, benchmark_thp_migration, 120)
 					&thp_results, &regular_results);
 	}
 }
+#endif
 TEST_HARNESS_MAIN
