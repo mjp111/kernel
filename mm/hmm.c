@@ -881,12 +881,15 @@ again:
 
 	pmd = pmdp_get_lockless(pmdp);
 	if (pmd_none(pmd)) {
-		if (!minfo)
-			return hmm_vma_walk_hole(start, end, -1, walk);
+		r = hmm_vma_walk_hole(start, end, -1, walk);
+		if (r || !minfo)
+			return r;
+
 		ptl = pmd_lock(walk->mm, pmdp);
 		if (pmd_none(*pmdp)) {
+			// hmm_vma_walk_hole() filled migration needs
 			spin_unlock(ptl);
-			return hmm_pfns_fill(start, end, hmm_vma_walk, 0);
+			return r;
 		}
 		spin_unlock(ptl);
 	}
@@ -901,16 +904,14 @@ again:
 		}
 		for (i = 0; addr < end; addr += PAGE_SIZE, hmm_pfns++)
 			range->hmm_pfns[i] &= HMM_PFN_INOUT_FLAGS;
+
+		return 0;
 	}
 
 	printk("mjp - walk2\n");
-	if (!pmd_present(pmd)) {
-		r =  hmm_vma_handle_absent_pmd(walk, start, end, hmm_pfns,
+	if (!pmd_present(pmd))
+		return  hmm_vma_handle_absent_pmd(walk, start, end, hmm_pfns,
 					       pmd);
-		if (r || !minfo)
-			return r;
-	}
-
 	printk("mjp - walk3\n");
 	if (pmd_trans_huge(pmd)) {
 		/*
