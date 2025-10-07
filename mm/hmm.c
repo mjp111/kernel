@@ -63,12 +63,11 @@ static int hmm_pfns_fill(unsigned long addr, unsigned long end,
 	struct hmm_range *range = hmm_vma_walk->range;
 	unsigned long i = (addr - range->start) >> PAGE_SHIFT;
 	enum migrate_vma_info minfo;
-
 	bool migrate = false;
 
+	minfo = hmm_select_migrate(range);
 	if (cpu_flags != HMM_PFN_ERROR) {
-		if (hmm_select_migrate(range) &&
-		    (vma_is_anonymous(hmm_vma_walk->vma))) {
+		if (minfo && (vma_is_anonymous(hmm_vma_walk->vma))) {
 			cpu_flags |= (HMM_PFN_VALID | HMM_PFN_MIGRATE);
 			migrate = true;
 		}
@@ -884,12 +883,12 @@ again:
 	if (pmd_none(pmd)) {
 		if (!minfo)
 			return hmm_vma_walk_hole(start, end, -1, walk);
-		ptl = pmd_lock(mm, pmdp);
+		ptl = pmd_lock(walk->mm, pmdp);
 		if (pmd_none(*pmdp)) {
 			spin_unlock(ptl);
 			return hmm_pfns_fill(start, end, hmm_vma_walk, 0);
 		}
-		splin_unlock(ptl);
+		spin_unlock(ptl);
 	}
 
 	if (thp_migration_supported() && is_pmd_migration_entry(pmd)) {
