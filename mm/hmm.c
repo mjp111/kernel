@@ -576,7 +576,7 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 	       for (i = 1, start += PAGE_SIZE; start < end; start += PAGE_SIZE, i++)
 			hmm_pfn[i] &= HMM_PFN_INOUT_FLAGS;
 
-	       printk("mjp - prepare pmd normal\n");
+	       printk("mjp - prepare pmd set pmd migration entry\n");
        } else {
 	       printk("mjp - prepare pmd fallback to small\n");
 	       r = -ENOENT;  // fallback
@@ -945,27 +945,29 @@ again:
 
 		if (r || !minfo)
 			return r;
-
-		r = hmm_vma_handle_migrate_prepare_pmd(walk, pmdp, start, end, hmm_pfns);
-
-		if (r == -ENOENT) {
-			r = hmm_vma_walk_split(pmdp, addr, walk);
-			if (r) {
-				/* Split not successful, skip */
-				return hmm_pfns_fill(start, end, hmm_vma_walk, HMM_PFN_ERROR);
-			}
-
-			/* Split successful or "again", reloop */
-			hmm_vma_walk->last = addr;
-			return -EBUSY;
-
-		}
-		if (r || minfo) {
-			printk("mjp - returning from walkpmd %d %lx\n", r,
-			       page_to_pfn(hmm_pfn_to_page(hmm_pfns[0])));
-			return r;
-		}
 	}
+
+	r = hmm_vma_handle_migrate_prepare_pmd(walk, pmdp, start, end, hmm_pfns);
+
+	if (r == -ENOENT) {
+		r = hmm_vma_walk_split(pmdp, addr, walk);
+		if (r) {
+			/* Split not successful, skip */
+			return hmm_pfns_fill(start, end, hmm_vma_walk, HMM_PFN_ERROR);
+		}
+
+		/* Split successful or "again", reloop */
+		hmm_vma_walk->last = addr;
+		return -EBUSY;
+
+	}
+	
+	if (r || minfo) {
+		printk("mjp - returning from walkpmd %d %lx\n", r,
+		       page_to_pfn(hmm_pfn_to_page(hmm_pfns[0])));
+		return r;
+	}
+
 
 	/*
 	 * We have handled all the valid cases above ie either none, migration,
