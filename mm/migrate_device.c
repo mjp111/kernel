@@ -1509,6 +1509,9 @@ void migrate_hmm_range_setup(struct hmm_range *range)
 	migrate->npages = (migrate->end - migrate->start) >> PAGE_SHIFT;
 	migrate->cpages = 0;
 
+	printk("mjp - migrate_hmm_range_setup for %lx %lu pages \n",
+	       page_to_pfn(hmm_pfn_to_page(range->hmm_pfns[0])), migrate->npages);
+
 	for (unsigned long i = 0; i < migrate->npages; i++) {
 
 		unsigned long pfn = range->hmm_pfns[i];
@@ -1523,6 +1526,7 @@ void migrate_hmm_range_setup(struct hmm_range *range)
 		    (HMM_PFN_VALID | HMM_PFN_MIGRATE)) {
 			migrate->src[i] = 0;
 			migrate->dst[i] = 0;
+//			printk("mjp - migrate_hmm_range_setup not valid\n");
 			continue;
 		}
 
@@ -1536,6 +1540,14 @@ void migrate_hmm_range_setup(struct hmm_range *range)
 		 */
 		if (pfn == (HMM_PFN_VALID|HMM_PFN_MIGRATE)) {
 			migrate->src[i] = MIGRATE_PFN_MIGRATE;
+			migrate->dst[i] = 0;
+			printk("mjp - migrate_hmm_range_setup normal zero page\n");
+			continue;
+		}
+		if (pfn == (HMM_PFN_VALID|HMM_PFN_MIGRATE|HMM_PFN_COMPOUND)) {
+			migrate->src[i] = MIGRATE_PFN_MIGRATE|MIGRATE_PFN_COMPOUND;
+			migrate->dst[i] = 0;
+			printk("mjp - migrate_hmm_range_setup huge zero page\n");
 			continue;
 		}
 
@@ -1547,6 +1559,8 @@ void migrate_hmm_range_setup(struct hmm_range *range)
 
 	if (migrate->cpages)
 		migrate_vma_unmap(migrate);
+
+	printk("mjp - migrate_hmm_range_setup end %lu\n", migrate->cpages);
 
 }
 EXPORT_SYMBOL(migrate_hmm_range_setup);

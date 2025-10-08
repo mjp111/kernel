@@ -81,6 +81,7 @@ static int hmm_pfns_fill(unsigned long addr, unsigned long end,
 		range->hmm_pfns[i] |= cpu_flags | HMM_PFN_COMPOUND;
 		addr += PAGE_SIZE;
 		i++;
+		cpu_flags = 0;
 	}
 
 	for (; addr < end; addr += PAGE_SIZE, i++) {
@@ -381,6 +382,7 @@ static int hmm_vma_handle_absent_pmd(struct mm_walk *walk, unsigned long start,
 		unsigned long pfn = swp_offset_pfn(entry);
 		unsigned long i;
 
+		printk("mjp -- handle absent pmd\n");
 		if (is_writable_device_private_entry(entry))
 			cpu_flags |= HMM_PFN_WRITE;
 
@@ -485,7 +487,7 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 	swp_entry_t entry;
 	enum migrate_vma_info minfo;
 	spinlock_t *ptl;
-	unsigned long i = (start - range->start) >> PAGE_SHIFT;
+	unsigned long i;
 	int r = 0;
 
 	printk("mjp - prepare pmd\n");
@@ -503,7 +505,7 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
         }
 
 	printk("mjp - prepare pmd 1\n");
-	if (!(range->hmm_pfns[i] & HMM_PFN_VALID))
+	if (!(*hmm_pfn & HMM_PFN_VALID))
 		goto out;
 
 	printk("mjp - prepare pmd 2\n");
@@ -514,6 +516,7 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
                 folio = pmd_folio(*pmdp);
                 if (is_huge_zero_folio(folio)) {
                         spin_unlock(ptl);
+			printk("mjp - prepare pmd zero\n");
 			return hmm_pfns_fill(start, end, hmm_vma_walk, 0);
                 }
 
@@ -530,6 +533,7 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 
 	} else {
 		spin_unlock(ptl);
+		printk("mjp - prepare pmd busy out\n");
                 return -EBUSY;
 	}
 
@@ -538,7 +542,8 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
        if (folio != fault_folio && unlikely(!folio_trylock(folio))) {
                 spin_unlock(ptl);
                 folio_put(folio);
-                return -ENOENT;  //mjp
+		printk("mjp - locked\n");
+                return 0;  //mjp
         }
 
        if (thp_migration_supported() &&
@@ -553,21 +558,29 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 		       .vma = walk->vma,
 	       };
 
-	       i = (start - range->start) >> PAGE_SHIFT;
-	       range->hmm_pfns[i] |= HMM_PFN_MIGRATE | HMM_PFN_COMPOUND;
-	       r =  hmm_pfns_fill(start + PAGE_SIZE, end, hmm_vma_walk, 0);
+	       unsigned long pfn = page_to_pfn(folio_page(folio, 0));
+	       printk("mjp - prepare pmd check %lx %lx\n", pfn,
+		      page_to_pfn(hmm_pfn_to_page(hmm_pfn[0])));
+
+	       hmm_pfn[0] |= HMM_PFN_MIGRATE | HMM_PFN_COMPOUND;
+
 	       if (r)
 		       goto out;
 
 	       r = set_pmd_migration_entry(&pvmw, folio_page(folio, 0));
 	       if (r) {
-		       range->hmm_pfns[i] &= ~(HMM_PFN_MIGRATE | HMM_PFN_COMPOUND);
+		       hmm_pfn[0] &= ~(HMM_PFN_MIGRATE | HMM_PFN_COMPOUND);
 		       r = -ENOENT;  // fallback
 		       goto out;
 	       }
-	       r =  hmm_pfns_fill(start + PAGE_SIZE, end, hmm_vma_walk, 0);
-       } else
+	       for (i = 1, start += PAGE_SIZE; start < end; start += PAGE_SIZE, i++)
+			hmm_pfn[i] &= HMM_PFN_INOUT_FLAGS;
+
+	       printk("mjp - prepare pmd normal\n");
+       } else {
+	       printk("mjp - prepare pmd fallback to small\n");
 	       r = -ENOENT;  // fallback
+       }
 
 
 out:
@@ -602,12 +615,12 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 	bool writable = false;
 	pte_t *ptep;
 
-	printk("mjp -- test\n");
 	// Do we want to migrate at all?
 	minfo = hmm_select_migrate(range);
 	if (!minfo)
 		return;
 
+	printk("mjp - prepare normal\n");
 	fault_folio = (migrate && migrate->fault_page) ?
 		page_folio(migrate->fault_page) : NULL;
 
@@ -697,8 +710,7 @@ again:
 		writable = pte_write(pte);
 	}
 
-	/* FIXME support THP */
-	if (!page || !page->mapping || PageTransCompound(page))
+	if (!page || !page->mapping)
 		goto out;
 
 	/*
@@ -875,7 +887,6 @@ static int hmm_vma_walk_pmd(pmd_t *pmdp,
 	pmd_t pmd;
 	int r;
 
-	printk("mjp - walk\n");
 	minfo = hmm_select_migrate(range);
 again:
 
@@ -902,17 +913,19 @@ again:
 				return -EBUSY;
 			}
 		}
-		for (i = 0; addr < end; addr += PAGE_SIZE, hmm_pfns++)
-			range->hmm_pfns[i] &= HMM_PFN_INOUT_FLAGS;
+		for (i = 0; addr < end; addr += PAGE_SIZE, i++)
+			hmm_pfns[i] &= HMM_PFN_INOUT_FLAGS;
 
 		return 0;
 	}
 
-	printk("mjp - walk2\n");
-	if (!pmd_present(pmd))
-		return  hmm_vma_handle_absent_pmd(walk, start, end, hmm_pfns,
-					       pmd);
-	printk("mjp - walk3\n");
+	if (!pmd_present(pmd)) {
+		r = hmm_vma_handle_absent_pmd(walk, start, end, hmm_pfns,
+					      pmd);
+		if (r || !minfo)
+			return r;
+	}
+
 	if (pmd_trans_huge(pmd)) {
 		/*
 		 * No need to take pmd_lock here, even if some other thread
@@ -923,6 +936,7 @@ again:
 		 * huge or device mapping one and compute corresponding pfn
 		 * values.
 		 */
+
 		pmd = pmdp_get_lockless(pmdp);
 		if (!pmd_trans_huge(pmd))
 			goto again;
@@ -946,11 +960,13 @@ again:
 			return -EBUSY;
 
 		}
-		if (r || minfo)
+		if (r || minfo) {
+			printk("mjp - returning from walkpmd %d %lx\n", r,
+			       page_to_pfn(hmm_pfn_to_page(hmm_pfns[0])));
 			return r;
+		}
 	}
 
-	printk("mjp - continue small\n");
 	/*
 	 * We have handled all the valid cases above ie either none, migration,
 	 * huge or transparent huge. At this point either it is a valid pmd
@@ -1174,7 +1190,7 @@ static const struct mm_walk_ops hmm_walk_ops = {
  * This is similar to get_user_pages(), except that it can read the page tables
  * without mutating them (ie causing faults).
  *
- * If want to do migrate after faultin, call hmm_range_fault() with
+ * If want to do migrate after faultin, call hmm_rangem_fault() with
  * HMM_PFN_REQ_MIGRATE and initialize range.migrate field.
  * After hmm_range_fault() call migrate_hmm_range_setup() instead of
  * migrate_vma_setup() and after that follow normal migrate calls path.
