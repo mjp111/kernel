@@ -399,11 +399,14 @@ static int hmm_vma_handle_absent_pmd(struct mm_walk *walk, unsigned long start,
 		return 0;
 	}
 
+	printk("mjp -- absent pmd not own\n");
 	required_fault = hmm_range_need_fault(hmm_vma_walk, hmm_pfns,
 					      npages, 0);
 	if (required_fault) {
-		if (is_device_private_entry(entry))
+		if (is_device_private_entry(entry)) {
+			printk("mjp -- absent pmd faulting\n");
 			return hmm_vma_fault(addr, end, required_fault, walk);
+		}
 		else
 			return -EFAULT;
 	}
@@ -533,7 +536,7 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 
 	} else {
 		spin_unlock(ptl);
-		printk("mjp - prepare pmd busy out\n");
+		printk("mjp - prepare pmd not big\n");
                 return -EBUSY;
 	}
 
@@ -919,55 +922,56 @@ again:
 		return 0;
 	}
 
-	if (!pmd_present(pmd)) {
-		r = hmm_vma_handle_absent_pmd(walk, start, end, hmm_pfns,
-					      pmd);
-		if (r || !minfo)
-			return r;
-	}
+	if (pmd_trans_huge(pmd) || !pmd_present(pmd)) {
 
-	if (pmd_trans_huge(pmd)) {
-		/*
-		 * No need to take pmd_lock here, even if some other thread
-		 * is splitting the huge pmd we will get that event through
-		 * mmu_notifier callback.
-		 *
-		 * So just read pmd value and check again it's a transparent
-		 * huge or device mapping one and compute corresponding pfn
-		 * values.
-		 */
+		if (!pmd_present(pmd)) {
+			r = hmm_vma_handle_absent_pmd(walk, start, end, hmm_pfns,
+						      pmd);
+			if (r || !minfo)
+				return r;
+		} else {
 
-		pmd = pmdp_get_lockless(pmdp);
-		if (!pmd_trans_huge(pmd))
-			goto again;
+			/*
+			 * No need to take pmd_lock here, even if some other thread
+			 * is splitting the huge pmd we will get that event through
+			 * mmu_notifier callback.
+			 *
+			 * So just read pmd value and check again it's a transparent
+			 * huge or device mapping one and compute corresponding pfn
+			 * values.
+			 */
 
-		r = hmm_vma_handle_pmd(walk, addr, end, hmm_pfns, pmd);
+			pmd = pmdp_get_lockless(pmdp);
+			if (!pmd_trans_huge(pmd))
+				goto again;
 
-		if (r || !minfo)
-			return r;
-	}
+			r = hmm_vma_handle_pmd(walk, addr, end, hmm_pfns, pmd);
 
-	r = hmm_vma_handle_migrate_prepare_pmd(walk, pmdp, start, end, hmm_pfns);
-
-	if (r == -ENOENT) {
-		r = hmm_vma_walk_split(pmdp, addr, walk);
-		if (r) {
-			/* Split not successful, skip */
-			return hmm_pfns_fill(start, end, hmm_vma_walk, HMM_PFN_ERROR);
+			if (r || !minfo)
+				return r;
 		}
 
-		/* Split successful or "again", reloop */
-		hmm_vma_walk->last = addr;
-		return -EBUSY;
+		r = hmm_vma_handle_migrate_prepare_pmd(walk, pmdp, start, end, hmm_pfns);
+
+		if (r == -ENOENT) {
+			r = hmm_vma_walk_split(pmdp, addr, walk);
+			if (r) {
+				/* Split not successful, skip */
+				return hmm_pfns_fill(start, end, hmm_vma_walk, HMM_PFN_ERROR);
+			}
+
+			/* Split successful or "again", reloop */
+			hmm_vma_walk->last = addr;
+			return -EBUSY;
+		}
+
+		if (r || minfo) {
+			printk("mjp - returning from walkpmd %d %lx\n", r,
+			       page_to_pfn(hmm_pfn_to_page(hmm_pfns[0])));
+			return r;
+		}
 
 	}
-	
-	if (r || minfo) {
-		printk("mjp - returning from walkpmd %d %lx\n", r,
-		       page_to_pfn(hmm_pfn_to_page(hmm_pfns[0])));
-		return r;
-	}
-
 
 	/*
 	 * We have handled all the valid cases above ie either none, migration,
