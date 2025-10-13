@@ -567,14 +567,11 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 
 	       hmm_pfn[0] |= HMM_PFN_MIGRATE | HMM_PFN_COMPOUND;
 
-	       if (r)
-		       goto out;
-
 	       r = set_pmd_migration_entry(&pvmw, folio_page(folio, 0));
 	       if (r) {
 		       hmm_pfn[0] &= ~(HMM_PFN_MIGRATE | HMM_PFN_COMPOUND);
 		       r = -ENOENT;  // fallback
-		       goto out;
+		       goto unlock_out;
 	       }
 	       for (i = 1, start += PAGE_SIZE; start < end; start += PAGE_SIZE, i++)
 			hmm_pfn[i] &= HMM_PFN_INOUT_FLAGS;
@@ -583,12 +580,20 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
        } else {
 	       printk("mjp - prepare pmd fallback to small\n");
 	       r = -ENOENT;  // fallback
+	       goto unlock_out;
        }
 
 
 out:
        spin_unlock(ptl);
        return r;
+
+unlock_out:
+       if (folio != fault_folio)
+	       folio_unlock(folio);
+       folio_put(folio);
+       goto out;
+
 }
 
 /*
@@ -623,7 +628,7 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 	if (!minfo)
 		return;
 
-	printk("mjp - prepare normal\n");
+//	printk("mjp - prepare normal\n");
 	fault_folio = (migrate && migrate->fault_page) ?
 		page_folio(migrate->fault_page) : NULL;
 
@@ -660,7 +665,7 @@ again:
 		if (!(minfo & MIGRATE_VMA_SELECT_DEVICE_PRIVATE))
 			goto out;
 
-		printk("mjp - migrate device\n");
+//		printk("mjp - migrate device\n");
 		page = pfn_swap_entry_to_page(entry);
 		folio = page_folio(page);
 		if (folio_test_large(folio)) {
@@ -823,19 +828,16 @@ static int hmm_vma_walk_split(pmd_t *pmdp,
 	} else {
 		folio_get(folio);
 		spin_unlock(ptl);
-		/* FIXME: we don't expect THP for fault_folio */
-		if (WARN_ON_ONCE(fault_folio == folio)) {
-			folio_put(folio);
-			ret = -EBUSY;
-			goto out;
-		}
-		if (unlikely(!folio_trylock(folio))) {
+
+		if (folio != fault_folio && unlikely(!folio_trylock(folio))) {
 			folio_put(folio);
 			ret = -EBUSY;
 			goto out;
 		}
 		ret = split_folio(folio);
-		folio_unlock(folio);
+		if (fault_folio != folio)
+			folio_unlock(folio);
+
 		folio_put(folio);
 	}
 out:
@@ -954,22 +956,29 @@ again:
 		r = hmm_vma_handle_migrate_prepare_pmd(walk, pmdp, start, end, hmm_pfns);
 
 		if (r == -ENOENT) {
+			printk("mjp -- preparing split\n");
 			r = hmm_vma_walk_split(pmdp, addr, walk);
 			if (r) {
+				printk("mjp -- split failed\n");
 				/* Split not successful, skip */
 				return hmm_pfns_fill(start, end, hmm_vma_walk, HMM_PFN_ERROR);
 			}
 
 			/* Split successful or "again", reloop */
+			printk("mjp -- split successfull\n");
 			hmm_vma_walk->last = addr;
 			return -EBUSY;
 		}
 
+#if 0
 		if (r || minfo) {
 			printk("mjp - returning from walkpmd %d %lx\n", r,
 			       page_to_pfn(hmm_pfn_to_page(hmm_pfns[0])));
 			return r;
 		}
+#else
+		return r;
+#endif
 
 	}
 
