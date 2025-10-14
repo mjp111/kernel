@@ -832,16 +832,21 @@ static int hmm_vma_walk_split(pmd_t *pmdp,
 		folio_get(folio);
 		spin_unlock(ptl);
 
-		if (folio != fault_folio && unlikely(!folio_trylock(folio))) {
+		if (folio != fault_folio) {
+			if (unlikely(!folio_trylock(folio))) {
+				folio_put(folio);
+				ret = -EBUSY;
+				goto out;
+			}
+		}  else
 			folio_put(folio);
-			ret = -EBUSY;
-			goto out;
-		}
-		ret = split_folio(folio);
-		if (fault_folio != folio)
-			folio_unlock(folio);
 
-		folio_put(folio);
+		ret = split_folio(folio);
+		if (fault_folio != folio) {
+			folio_unlock(folio);
+			folio_put(folio);
+		}
+
 	}
 out:
 	return ret;
