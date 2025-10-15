@@ -509,9 +509,11 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
         }
 
 //	printk("mjp - prepare pmd 1\n");
+#if 0
 	if (!(*hmm_pfn & HMM_PFN_VALID))
 		goto out;
 
+#endif
 //	printk("mjp - prepare pmd 2\n");
         if (pmd_trans_huge(*pmdp)) {
                 if (!(minfo & MIGRATE_VMA_SELECT_SYSTEM))
@@ -532,6 +534,8 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 
 		// We have already checked that are the pgmap owners
 		if (!(minfo & MIGRATE_VMA_SELECT_DEVICE_PRIVATE))
+			goto out;
+		if (folio->pgmap->owner != migrate->pgmap_owner)
 			goto out;
 //		printk("mjp - migrate big device\n");
 
@@ -649,11 +653,12 @@ again:
 		}
 	}
 
+#if 0
 	if (!(*hmm_pfn & HMM_PFN_VALID)) {
 		printk("mjp -- normal prepare not valid\n");
 		goto out;
 	}
-
+#endif
 	if (!pte_present(pte)) {
 		/*
 		 * Only care about unaddressable device page special
@@ -671,6 +676,9 @@ again:
 //		printk("mjp - migrate device\n");
 		page = pfn_swap_entry_to_page(entry);
 		folio = page_folio(page);
+		if (folio->pgmap->owner != migrate->pgmap_owner)
+			goto out;
+
 		if (folio_test_large(folio)) {
 			int ret;
 
