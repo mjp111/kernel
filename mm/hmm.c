@@ -467,8 +467,10 @@ static int migrate_vma_split_folio(struct folio *folio,
                 folio_unlock(folio);
                 folio_put(folio);
         } else if (folio != new_fault_folio) {
-                folio_get(new_fault_folio);
-                folio_lock(new_fault_folio);
+		if (new_fault_folio != fault_folio) {
+			folio_get(new_fault_folio);
+			folio_lock(new_fault_folio);
+		}
                 folio_unlock(folio);
                 folio_put(folio);
         }
@@ -588,7 +590,7 @@ unlock_out:
  * or migrate paths.
  *
  */
-static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
+static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 					   pmd_t *pmdp,
 					   unsigned long addr,
 					   unsigned long *hmm_pfn)
@@ -613,7 +615,7 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 	// Do we want to migrate at all?
 	minfo = hmm_select_migrate(range);
 	if (!minfo)
-		return;
+		return 0;
 
 	fault_folio = (migrate && migrate->fault_page) ?
 		page_folio(migrate->fault_page) : NULL;
@@ -621,7 +623,7 @@ static void hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 again:
 	ptep = pte_offset_map_lock(mm, pmdp, addr, &ptl);
 	if (!ptep)
-		return;
+		return 0;
 
 	pte = ptep_get(ptep);
 
@@ -781,7 +783,9 @@ again:
 		folio_put(folio);
 out:
 	pte_unmap_unlock(ptep, ptl);
-	out_unlocked:
+	return 0;
+out_unlocked:
+	return -1;
 
 }
 
@@ -983,7 +987,9 @@ again:
 			return r;
 		}
 
-		hmm_vma_handle_migrate_prepare(walk, pmdp, addr, hmm_pfns);
+		r = hmm_vma_handle_migrate_prepare(walk, pmdp, addr, hmm_pfns);
+		if (r)
+			break;
 	}
 	pte_unmap(ptep - 1);
 
