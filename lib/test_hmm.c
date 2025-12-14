@@ -1724,6 +1724,10 @@ static const struct dev_pagemap_ops dmirror_devmem_ops = {
 	.folio_split	= dmirror_devmem_folio_split,
 };
 
+static void dmirror_device_release(struct device *dev)
+{
+}
+
 static int dmirror_device_init(struct dmirror_device *mdevice, int id)
 {
 	dev_t dev;
@@ -1737,6 +1741,7 @@ static int dmirror_device_init(struct dmirror_device *mdevice, int id)
 	mdevice->cdevice.owner = THIS_MODULE;
 	device_initialize(&mdevice->device);
 	mdevice->device.devt = dev;
+	mdevice->device.release = dmirror_device_release;
 
 	ret = dev_set_name(&mdevice->device, "hmm_dmirror%u", id);
 	if (ret)
