@@ -1272,7 +1272,7 @@ static int dmirror_fault_and_migrate_to_device(struct dmirror *dmirror,
 	/*
 	 * Return the migrated data for verification.
 	 * Only for pages in device zone
-	 ***/
+	 */
 	ret = dmirror_bounce_init(&bounce, start, size);
 	if (ret)
 		goto out_mmput;
