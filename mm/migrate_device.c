@@ -1548,7 +1548,7 @@ void migrate_hmm_range_setup(struct hmm_range *range)
 			continue;
 		}
 
-		migrate->src[i] = migrate_pfn(page_to_pfn(hmm_pfn_to_page(pfn)))
+		migrate->src[i] = migrate_pfn_from_page(hmm_pfn_to_page(pfn))
 			| MIGRATE_PFN_MIGRATE;
 		migrate->src[i] |= (pfn & HMM_PFN_WRITE) ? MIGRATE_PFN_WRITE : 0;
 		migrate->src[i] |= (pfn & HMM_PFN_COMPOUND) ? MIGRATE_PFN_COMPOUND : 0;

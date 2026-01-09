@@ -754,11 +754,14 @@ again:
 
 		/* Setup special migration page table entry */
 		if (writable)
-			entry = make_writable_migration_entry(pfn);
+			entry = make_writable_migration_entry_from_page(
+						page, 0);
 		else if (anon_exclusive)
-			entry = make_readable_exclusive_migration_entry(pfn);
+			entry = make_readable_exclusive_migration_entry_from_page(
+						page, 0);
 		else
-			entry = make_readable_migration_entry(pfn);
+			entry = make_readable_migration_entry_from_page(
+						page, 0);
 
 		swp_pte = swp_entry_to_pte(entry);
 		if (pte_present(pte)) {
