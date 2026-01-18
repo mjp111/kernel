@@ -40,6 +40,7 @@ struct hmm_vma_walk {
 	unsigned long			end;
 	unsigned long			last;
 	bool 				locked;
+	bool				pmdlocked;
 	spinlock_t 			*ptl;
 };
 
@@ -233,8 +234,13 @@ static int hmm_vma_handle_pmd(struct mm_walk *walk, unsigned long addr,
 	cpu_flags = pmd_to_hmm_pfn_flags(range, pmd);
 	required_fault =
 		hmm_range_need_fault(hmm_vma_walk, hmm_pfns, npages, cpu_flags);
-	if (required_fault)
+	if (required_fault) {
+		if (hmm_vma_walk->pmdlocked) {
+			spin_unlock(hmm_vma_walk->ptl);
+			hmm_vma_walk->pmdlocked = false;
+		}
 		return hmm_vma_fault(addr, end, required_fault, walk);
+	}
 
 	pfn = pmd_pfn(pmd) + ((addr & ~PMD_MASK) >> PAGE_SHIFT);
 	for (i = 0; addr < end; addr += PAGE_SIZE, i++, pfn++) {
@@ -420,8 +426,13 @@ static int hmm_vma_handle_absent_pmd(struct mm_walk *walk, unsigned long start,
 	required_fault = hmm_range_need_fault(hmm_vma_walk, hmm_pfns,
 					      npages, 0);
 	if (required_fault) {
-		if (softleaf_is_device_private(entry))
+		if (softleaf_is_device_private(entry)) {
+			if (hmm_vma_walk->pmdlocked) {
+				spin_unlock(hmm_vma_walk->ptl);
+				hmm_vma_walk->pmdlocked = false;
+			}
 			return hmm_vma_fault(addr, end, required_fault, walk);
+		}
 		else
 			return -EFAULT;
 	}
@@ -501,11 +512,9 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 	struct hmm_vma_walk *hmm_vma_walk = walk->private;
 	struct hmm_range *range = hmm_vma_walk->range;
 	struct migrate_vma *migrate = range->migrate;
-	struct mm_struct *mm = walk->vma->vm_mm;
 	struct folio *fault_folio = NULL;
 	struct folio *folio;
 	enum migrate_vma_info minfo;
-	spinlock_t *ptl;
 	unsigned long i;
 	int r = 0;
 
@@ -516,21 +525,16 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 	fault_folio = (migrate && migrate->fault_page) ?
 		page_folio(migrate->fault_page) : NULL;
 
-	ptl = pmd_lock(mm, pmdp);
-	if (pmd_none(*pmdp)) {
-		spin_unlock(ptl);
+	if (pmd_none(*pmdp))
 		return hmm_pfns_fill(start, end, hmm_vma_walk, 0);
-	}
 
 	if (pmd_trans_huge(*pmdp)) {
 		if (!(minfo & MIGRATE_VMA_SELECT_SYSTEM))
 			goto out;
 
 		folio = pmd_folio(*pmdp);
-		if (is_huge_zero_folio(folio)) {
-			spin_unlock(ptl);
+		if (is_huge_zero_folio(folio))
 			return hmm_pfns_fill(start, end, hmm_vma_walk, 0);
-		}
 
 	} else if (!pmd_present(*pmdp)) {
 		const softleaf_t entry = softleaf_from_pmd(*pmdp);
@@ -546,14 +550,13 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 			goto out;
 
 	} else {
-		spin_unlock(ptl);
+		hmm_vma_walk->last = start;
 		return -EBUSY;
 	}
 
 	folio_get(folio);
 
 	if (folio != fault_folio && unlikely(!folio_trylock(folio))) {
-		spin_unlock(ptl);
 		folio_put(folio);
 		return 0;
 	}
@@ -564,7 +567,7 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 	     IS_ALIGNED(end, HPAGE_PMD_SIZE))) {
 
 		struct page_vma_mapped_walk pvmw = {
-			.ptl = ptl,
+			.ptl = hmm_vma_walk->ptl,
 			.address = start,
 			.pmd = pmdp,
 			.vma = walk->vma,
@@ -588,7 +591,6 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 
 
 out:
-	spin_unlock(ptl);
 	return r;
 
 unlock_out:
@@ -932,6 +934,7 @@ static int hmm_vma_walk_pmd(pmd_t *pmdp,
 
 again:
 	hmm_vma_walk->locked = false;
+	hmm_vma_walk->pmdlocked = false;
 	pmd = pmdp_get_lockless(pmdp);
 	if (pmd_none(pmd)) {
 		r = hmm_vma_walk_hole(start, end, -1, walk);
@@ -961,6 +964,14 @@ again:
 		return 0;
 	}
 
+	if (minfo) {
+		hmm_vma_walk->ptl = pmd_lock(mm, pmdp);
+		hmm_vma_walk->pmdlocked = true;
+		pmd = pmdp_get(pmdp);
+	}
+	else
+		pmd = pmdp_get_lockless(pmdp);
+
 	if (pmd_trans_huge(pmd) || !pmd_present(pmd)) {
 
 		if (!pmd_present(pmd)) {
@@ -971,18 +982,19 @@ again:
 		} else {
 
 			/*
-			 * No need to take pmd_lock here, even if some other thread
-			 * is splitting the huge pmd we will get that event through
-			 * mmu_notifier callback.
+			 * No need to take pmd_lock here if not migrating,
+			 * even if some other thread is splitting the huge
+			 * pmd we will get that event through mmu_notifier callback.
 			 *
 			 * So just read pmd value and check again it's a transparent
 			 * huge or device mapping one and compute corresponding pfn
 			 * values.
 			 */
 
-			pmd = pmdp_get_lockless(pmdp);
-			if (!pmd_trans_huge(pmd))
+			if (!pmd_trans_huge(pmd)) {
+				// must be lockless
 				goto again;
+			}
 
 			r = hmm_vma_handle_pmd(walk, addr, end, hmm_pfns, pmd);
 
@@ -991,6 +1003,11 @@ again:
 		}
 
 		r = hmm_vma_handle_migrate_prepare_pmd(walk, pmdp, start, end, hmm_pfns);
+
+		if (hmm_vma_walk->pmdlocked) {
+			spin_unlock(hmm_vma_walk->ptl);
+			hmm_vma_walk->pmdlocked = false;
+		}
 
 		if (r == -ENOENT) {
 			r = hmm_vma_walk_split(pmdp, addr, walk);
@@ -1006,6 +1023,11 @@ again:
 
 		return r;
 
+	}
+
+	if (hmm_vma_walk->pmdlocked) {
+		spin_unlock(hmm_vma_walk->ptl);
+		hmm_vma_walk->pmdlocked = false;
 	}
 
 	/*
