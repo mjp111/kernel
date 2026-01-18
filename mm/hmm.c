@@ -768,6 +768,9 @@ static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 			pte = ptep_get_and_clear(mm, addr, ptep);
 		}
 
+		if (pte_dirty(pte))
+			folio_mark_dirty(folio);
+
 		/* Setup special migration page table entry */
 		if (writable)
 			entry = make_writable_migration_entry(pfn);
@@ -775,6 +778,13 @@ static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 			entry = make_readable_exclusive_migration_entry(pfn);
 		else
 			entry = make_readable_migration_entry(pfn);
+
+		if (pte_present(pte)) {
+                       if (pte_young(pte))
+                               entry = make_migration_entry_young(entry);
+                       if (pte_dirty(pte))
+                               entry = make_migration_entry_dirty(entry);
+		}
 
 		swp_pte = swp_entry_to_pte(entry);
 		if (pte_present(pte)) {
