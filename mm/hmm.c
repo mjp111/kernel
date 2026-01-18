@@ -705,8 +705,8 @@ static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 				goto out;
 		}
 
-		folio = page_folio(page);
-		if (folio_test_large(folio)) {
+		folio = page ? page_folio(page) : NULL;
+		if (folio && folio_test_large(folio)) {
 			int ret;
 
 			pte_unmap_unlock(ptep, hmm_vma_walk->ptl);
