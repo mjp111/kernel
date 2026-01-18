@@ -677,9 +677,8 @@ static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 			ret = migrate_vma_split_folio(folio,
 						      migrate->fault_page);
 			if (ret)
-				goto out_unlocked;
-			//goto again;
-			return -2;
+				goto out_error;
+			return -EAGAIN;
 		}
 
 		pfn = page_to_pfn(page);
@@ -715,10 +714,8 @@ static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 			ret = migrate_vma_split_folio(folio,
 						      migrate->fault_page);
 			if (ret)
-				goto out_unlocked;
-
-			// goto again;
-			return -2;
+				goto out_error;
+			return -EAGAIN;
 		}
 
 		writable = pte_write(pte);
@@ -803,8 +800,8 @@ static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 		folio_put(folio);
 out:
 	return 0;
-out_unlocked:
-	return -1;
+out_error:
+	return -EFAULT;
 
 }
 
@@ -1061,7 +1058,7 @@ again:
 		}
 
 		r = hmm_vma_handle_migrate_prepare(walk, pmdp, ptep, addr, hmm_pfns);
-		if (r == -2) {
+		if (r == -EAGAIN) {
 			addr = start;
 			goto again;
 		}
