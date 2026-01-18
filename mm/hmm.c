@@ -633,7 +633,7 @@ static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 	fault_folio = (migrate && migrate->fault_page) ?
 		page_folio(migrate->fault_page) : NULL;
 
-again:
+//again:
 	if (!hmm_vma_walk->locked) {
 		ptep = pte_offset_map_lock(mm, pmdp, addr, &hmm_vma_walk->ptl);
 		hmm_vma_walk->locked = true;
@@ -676,7 +676,8 @@ again:
 						      migrate->fault_page);
 			if (ret)
 				goto out_unlocked;
-			goto again;
+			//goto again;
+			return -2;
 		}
 
 		pfn = page_to_pfn(page);
@@ -714,7 +715,8 @@ again:
 			if (ret)
 				goto out_unlocked;
 
-			goto again;
+			// goto again;
+			return -2;
 		}
 
 		writable = pte_write(pte);
@@ -1037,6 +1039,10 @@ again:
 		}
 
 		r = hmm_vma_handle_migrate_prepare(walk, pmdp, ptep, addr, hmm_pfns);
+		if (r == -2) {
+			addr = start;
+			goto again;
+		}
 		if (r) {
 			hmm_pfns_fill(addr, end, hmm_vma_walk, HMM_PFN_ERROR);
 			break;
