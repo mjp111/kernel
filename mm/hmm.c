@@ -558,6 +558,7 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 
 	if (folio != fault_folio && unlikely(!folio_trylock(folio))) {
 		folio_put(folio);
+		hmm_pfns_fill(start, end, hmm_vma_walk, HMM_PFN_ERROR);
 		return 0;
 	}
 
