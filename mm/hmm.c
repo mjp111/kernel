@@ -39,6 +39,8 @@ struct hmm_vma_walk {
 	unsigned long			start;
 	unsigned long			end;
 	unsigned long			last;
+	bool 				locked;
+	spinlock_t 			*ptl;
 };
 
 enum {
@@ -313,7 +315,13 @@ static int hmm_vma_handle_pte(struct mm_walk *walk, unsigned long addr,
 
 		if (softleaf_is_migration(entry)) {
 			if (!hmm_select_migrate(range)) {
-				pte_unmap(ptep);
+
+				if (hmm_vma_walk->locked) {
+					pte_unmap_unlock(ptep, hmm_vma_walk->ptl);
+					hmm_vma_walk->locked = false;
+				} else 			
+					pte_unmap(ptep);
+
 				hmm_vma_walk->last = addr;
 				migration_entry_wait(walk->mm, pmdp, addr);
 				return -EBUSY;
@@ -322,7 +330,13 @@ static int hmm_vma_handle_pte(struct mm_walk *walk, unsigned long addr,
 		}
 
 		/* Report error for everything else */
-		pte_unmap(ptep);
+				
+		if (hmm_vma_walk->locked) {
+			pte_unmap_unlock(ptep, hmm_vma_walk->ptl);
+			hmm_vma_walk->locked = false;
+		} else 			
+			pte_unmap(ptep);
+		
 		return -EFAULT;
 	}
 
@@ -339,7 +353,13 @@ static int hmm_vma_handle_pte(struct mm_walk *walk, unsigned long addr,
 	if (!vm_normal_page(walk->vma, addr, pte) &&
 	    !is_zero_pfn(pte_pfn(pte))) {
 		if (hmm_pte_need_fault(hmm_vma_walk, pfn_req_flags, 0)) {
-			pte_unmap(ptep);
+			
+			if (hmm_vma_walk->locked) {
+				pte_unmap_unlock(ptep, hmm_vma_walk->ptl);
+				hmm_vma_walk->locked = false;
+			} else 			
+				pte_unmap(ptep);
+
 			return -EFAULT;
 		}
 		new_pfn_flags = HMM_PFN_ERROR;
@@ -352,7 +372,11 @@ out:
 	return 0;
 
 fault:
-	pte_unmap(ptep);
+	if (hmm_vma_walk->locked) {
+		pte_unmap_unlock(ptep, hmm_vma_walk->ptl);
+		hmm_vma_walk->locked = false;
+	} else
+		pte_unmap(ptep);
 	/* Fault any virtual address we were asked to fault */
 	return hmm_vma_fault(addr, end, required_fault, walk);
 }
@@ -582,6 +606,7 @@ unlock_out:
  */
 static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 					  pmd_t *pmdp,
+					  pte_t *ptep,
 					  unsigned long addr,
 					  unsigned long *hmm_pfn)
 {
@@ -598,9 +623,7 @@ static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 	struct page *page;
 	softleaf_t entry;
 	pte_t pte, swp_pte;
-	spinlock_t *ptl;
 	bool writable = false;
-	pte_t *ptep;
 
 	// Do we want to migrate at all?
 	minfo = hmm_select_migrate(range);
@@ -611,10 +634,10 @@ static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 		page_folio(migrate->fault_page) : NULL;
 
 again:
-	ptep = pte_offset_map_lock(mm, pmdp, addr, &ptl);
-	if (!ptep)
-		return 0;
-
+	if (!hmm_vma_walk->locked) {
+		ptep = pte_offset_map_lock(mm, pmdp, addr, &hmm_vma_walk->ptl);
+		hmm_vma_walk->locked = true;
+	}
 	pte = ptep_get(ptep);
 
 	if (pte_none(pte)) {
@@ -647,7 +670,8 @@ again:
 		if (folio_test_large(folio)) {
 			int ret;
 
-			pte_unmap_unlock(ptep, ptl);
+			pte_unmap_unlock(ptep, hmm_vma_walk->ptl);
+			hmm_vma_walk->locked = false;
 			ret = migrate_vma_split_folio(folio,
 						      migrate->fault_page);
 			if (ret)
@@ -682,7 +706,9 @@ again:
 		if (folio_test_large(folio)) {
 			int ret;
 
-			pte_unmap_unlock(ptep, ptl);
+			pte_unmap_unlock(ptep, hmm_vma_walk->ptl);
+			hmm_vma_walk->locked = false;
+			
 			ret = migrate_vma_split_folio(folio,
 						      migrate->fault_page);
 			if (ret)
@@ -772,7 +798,6 @@ again:
 	} else
 		folio_put(folio);
 out:
-	pte_unmap_unlock(ptep, ptl);
 	return 0;
 out_unlocked:
 	return -1;
@@ -892,6 +917,7 @@ static int hmm_vma_walk_pmd(pmd_t *pmdp,
 	unsigned long *hmm_pfns =
 		&range->hmm_pfns[(start - range->start) >> PAGE_SHIFT];
 	unsigned long npages = (end - start) >> PAGE_SHIFT;
+	struct mm_struct *mm = walk->vma->vm_mm;
 	unsigned long addr = start;
 	enum migrate_vma_info minfo;
 	unsigned long i;
@@ -901,8 +927,9 @@ static int hmm_vma_walk_pmd(pmd_t *pmdp,
 	int r;
 
 	minfo = hmm_select_migrate(range);
-again:
 
+again:
+	hmm_vma_walk->locked = false;
 	pmd = pmdp_get_lockless(pmdp);
 	if (pmd_none(pmd)) {
 		r = hmm_vma_walk_hole(start, end, -1, walk);
@@ -991,9 +1018,16 @@ again:
 		return hmm_pfns_fill(start, end, hmm_vma_walk, HMM_PFN_ERROR);
 	}
 
-	ptep = pte_offset_map(pmdp, addr);
+	if (minfo) {
+		ptep = pte_offset_map_lock(mm, pmdp, addr, &hmm_vma_walk->ptl);
+		if (ptep)
+			hmm_vma_walk->locked = true;
+	}
+	else
+		ptep = pte_offset_map(pmdp, addr);
 	if (!ptep)
 		goto again;
+	
 	for (; addr < end; addr += PAGE_SIZE, ptep++, hmm_pfns++) {
 
 		r = hmm_vma_handle_pte(walk, addr, end, pmdp, ptep, hmm_pfns);
@@ -1002,11 +1036,17 @@ again:
 			return r;
 		}
 
-		r = hmm_vma_handle_migrate_prepare(walk, pmdp, addr, hmm_pfns);
-		if (r)
+		r = hmm_vma_handle_migrate_prepare(walk, pmdp, ptep, addr, hmm_pfns);
+		if (r) {
+			hmm_pfns_fill(addr, end, hmm_vma_walk, HMM_PFN_ERROR);
 			break;
+		}
 	}
-	pte_unmap(ptep - 1);
+
+	if (hmm_vma_walk->locked) 
+		pte_unmap_unlock(ptep - 1, hmm_vma_walk->ptl);	
+	else
+		pte_unmap(ptep - 1);
 
 	return 0;
 }
