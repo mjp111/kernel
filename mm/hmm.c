@@ -874,6 +874,7 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 
 static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 					  pmd_t *pmdp,
+					  pte_t *pte,
 					  unsigned long addr,
 					  unsigned long *hmm_pfn)
 {
