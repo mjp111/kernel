@@ -528,6 +528,9 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 	if (pmd_none(*pmdp))
 		return hmm_pfns_fill(start, end, hmm_vma_walk, 0);
 
+	if (!(hmm_pfn[0] & HMM_PFN_VALID))
+		goto out;
+
 	if (pmd_trans_huge(*pmdp)) {
 		if (!(minfo & MIGRATE_VMA_SELECT_SYSTEM))
 			goto out;
@@ -650,6 +653,9 @@ static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 			goto out;
 		}
 	}
+
+	if (!(hmm_pfn[0] & HMM_PFN_VALID))
+		goto out;
 
 	if (!pte_present(pte)) {
 		/*
