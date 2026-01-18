@@ -636,7 +636,6 @@ static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 	fault_folio = (migrate && migrate->fault_page) ?
 		page_folio(migrate->fault_page) : NULL;
 
-//again:
 	if (!hmm_vma_walk->locked) {
 		ptep = pte_offset_map_lock(mm, pmdp, addr, &hmm_vma_walk->ptl);
 		hmm_vma_walk->locked = true;
@@ -1071,7 +1070,6 @@ again:
 
 		r = hmm_vma_handle_migrate_prepare(walk, pmdp, ptep, addr, hmm_pfns);
 		if (r == -EAGAIN) {
-			addr = start;
 			goto again;
 		}
 		if (r) {
