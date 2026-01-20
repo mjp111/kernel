@@ -520,7 +520,8 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 	if (!minfo)
 		return r;
 
-	fault_folio = (migrate && migrate->fault_page) ?
+	WARN_ON_ONCE(!migrate);
+	fault_folio = migrate->fault_page ?
 		page_folio(migrate->fault_page) : NULL;
 
 	if (pmd_none(*pmdp))
@@ -547,6 +548,7 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 
 		if (!(minfo & MIGRATE_VMA_SELECT_DEVICE_PRIVATE))
 			goto out;
+
 		if (folio->pgmap->owner != migrate->pgmap_owner)
 			goto out;
 
@@ -634,7 +636,9 @@ static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 	if (!minfo)
 		return 0;
 
-	fault_folio = (migrate && migrate->fault_page) ?
+	WARN_ON_ONCE(!migrate);
+
+	fault_folio = migrate->fault_page ?
 		page_folio(migrate->fault_page) : NULL;
 
 	if (!hmm_vma_walk->locked) {
@@ -940,7 +944,7 @@ static int hmm_vma_walk_pmd(pmd_t *pmdp,
 	spinlock_t *ptl;
 	pte_t *ptep;
 	pmd_t pmd;
-	int r;
+	int r = 0;
 
 	minfo = hmm_select_migrate(range);
 
@@ -950,6 +954,7 @@ again:
 	pmd = pmdp_get_lockless(pmdp);
 	if (pmd_none(pmd)) {
 		r = hmm_vma_walk_hole(start, end, -1, walk);
+		// If not migrating we are done
 		if (r || !minfo)
 			return r;
 
@@ -957,7 +962,7 @@ again:
 		if (pmd_none(*pmdp)) {
 			// hmm_vma_walk_hole() filled migration needs
 			spin_unlock(ptl);
-			return r;
+			return 0;
 		}
 		spin_unlock(ptl);
 	}
@@ -988,6 +993,7 @@ again:
 		if (!pmd_present(pmd)) {
 			r = hmm_vma_handle_absent_pmd(walk, start, end, hmm_pfns,
 						      pmd);
+			// If not migrating we are done
 			if (r || !minfo)
 				return r;
 		} else {
@@ -1009,6 +1015,7 @@ again:
 
 			r = hmm_vma_handle_pmd(walk, addr, end, hmm_pfns, pmd);
 
+			// If not migrating we are done
 			if (r || !minfo)
 				return r;
 		}
@@ -1307,6 +1314,7 @@ int hmm_range_fault(struct hmm_range *range)
 #ifdef CONFIG_DEVICE_MIGRATION
 	mm = is_fault_path ? range->notifier->mm : range->migrate->vma->vm_mm;
 #else
+	WARN_ON_ONCE(!faulting_path);
 	mm = range->notifier->mm;
 #endif
 	mmap_assert_locked(mm);
