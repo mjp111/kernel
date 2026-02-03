@@ -36,6 +36,7 @@
 #define DMIRROR_RANGE_FAULT_TIMEOUT	1000
 #define DEVMEM_CHUNK_SIZE		(256 * 1024 * 1024U)
 #define DEVMEM_CHUNKS_RESERVE		16
+#define PFNS_ARRAY_SIZE			64
 
 /*
  * For device_private pages, dpage is just a dummy struct page
@@ -290,6 +291,23 @@ static int dmirror_do_fault(struct dmirror *dmirror, struct hmm_range *range)
 		page = hmm_pfn_to_page(*pfns);
 		WARN_ON(!page);
 
+		/*
+		 * Device private pages are backed by system pages: map those.
+		 * Like the rest of the dmirror page table handling, this relies
+		 * on the dmirror's own invalidations, and MIGRATE invalidations
+		 * of this device are skipped. A CPU fault migrating the page
+		 * back concurrently, or a second dmirror of the same range, can
+		 * therefore leave a stale entry, as HMM_DMIRROR_MIGRATE_TO_SYS
+		 * already can. The selftests do neither.
+		 */
+		if (is_device_private_page(page)) {
+			struct folio *folio = page_folio(page);
+			struct page *rpage = BACKING_PAGE(folio_page(folio, 0));
+
+			page = folio_page(page_folio(rpage),
+					  folio_page_idx(folio, page));
+		}
+
 		entry = page;
 		if (*pfns & HMM_PFN_WRITE)
 			entry = xa_tag_pointer(entry, DPT_XA_TAG_WRITE);
@@ -355,6 +373,7 @@ static int dmirror_range_fault(struct dmirror *dmirror,
 	struct mm_struct *mm = dmirror->notifier.mm;
 	unsigned long timeout =
 		jiffies + msecs_to_jiffies(HMM_RANGE_DEFAULT_TIMEOUT);
+	bool migrate = range->default_flags & HMM_PFN_REQ_MIGRATE;
 	int ret;
 
 	while (true) {
@@ -364,6 +383,15 @@ static int dmirror_range_fault(struct dmirror *dmirror,
 		}
 
 		range->notifier_seq = mmu_interval_read_begin(range->notifier);
+
+		/*
+		 * mmap lock held for whole migrate on fault operation. A
+		 * migrating call isn't retried here: the caller aborts the
+		 * partial migration first.
+		 */
+		if (migrate)
+			return hmm_range_fault(range);
+
 		mmap_read_lock(mm);
 		ret = hmm_range_fault(range);
 		mmap_read_unlock(mm);
@@ -994,8 +1022,12 @@ static int dmirror_atomic_map(unsigned long addr, struct page *page,
 	return 0;
 }
 
-static int dmirror_migrate_finalize_and_map(struct migrate_vma *args,
-					    struct dmirror *dmirror)
+/*
+ * Map the migrated pages into the device's page table. Caller must hold
+ * dmirror->mutex.
+ */
+static int __dmirror_migrate_map_locked(struct migrate_vma *args,
+					struct dmirror *dmirror)
 {
 	unsigned long start = args->start;
 	unsigned long end = args->end;
@@ -1004,9 +1036,6 @@ static int dmirror_migrate_finalize_and_map(struct migrate_vma *args,
 	unsigned long pfn;
 	const unsigned long start_pfn = start >> PAGE_SHIFT;
 	const unsigned long end_pfn = end >> PAGE_SHIFT;
-
-	/* Map the migrated pages into the device's page tables. */
-	mutex_lock(&dmirror->mutex);
 
 	for (pfn = start_pfn; pfn < end_pfn; pfn++, src++, dst++) {
 		struct page *dpage;
@@ -1036,15 +1065,25 @@ static int dmirror_migrate_finalize_and_map(struct migrate_vma *args,
 			if (*dst & MIGRATE_PFN_WRITE)
 				entry = xa_tag_pointer(entry, DPT_XA_TAG_WRITE);
 			entry = xa_store(&dmirror->pt, pfn + i, entry, GFP_ATOMIC);
-			if (xa_is_err(entry)) {
-				mutex_unlock(&dmirror->mutex);
+			if (xa_is_err(entry))
 				return xa_err(entry);
-			}
 		}
 	}
 
-	mutex_unlock(&dmirror->mutex);
 	return 0;
+}
+
+static int dmirror_migrate_finalize_and_map(struct migrate_vma *args,
+					    struct dmirror *dmirror)
+{
+	int ret;
+
+	/* Map the migrated pages into the device's page tables. */
+	mutex_lock(&dmirror->mutex);
+	ret = __dmirror_migrate_map_locked(args, dmirror);
+	mutex_unlock(&dmirror->mutex);
+
+	return ret;
 }
 
 static int dmirror_exclusive(struct dmirror *dmirror,
@@ -1379,6 +1418,152 @@ free_mem:
 	return ret;
 }
 
+static int do_fault_and_migrate(struct dmirror *dmirror, struct hmm_range *range)
+{
+	struct migrate_vma *migrate = range->migrate;
+	unsigned long timeout =
+		jiffies + msecs_to_jiffies(HMM_RANGE_DEFAULT_TIMEOUT);
+	int ret;
+
+	do {
+		mmap_read_lock(dmirror->notifier.mm);
+
+		/* Fault-in pages for migration */
+		ret = dmirror_range_fault(dmirror, range);
+		/*
+		 * Set this up even on error: hmm_range_fault() may have collected
+		 * part of the range before failing.
+		 */
+		migrate_hmm_range_setup(range);
+		if (ret) {
+			/*
+			 * dst[] entries are empty, so this marks every collected
+			 * migration as failed. finalize then restores the source
+			 * mappings and drops the associated locks/references.
+			 */
+			migrate_vma_pages(migrate);
+			migrate_vma_finalize(migrate);
+			goto unlock;
+		}
+
+		pr_debug("Migrating from sys mem to device mem\n");
+
+		dmirror_migrate_alloc_and_copy(migrate, dmirror);
+		migrate_vma_pages(migrate);
+
+		mutex_lock(&dmirror->mutex);
+		if (mmu_interval_read_retry(&dmirror->notifier,
+					    range->notifier_seq)) {
+			/*
+			 * The migration may already be committed, and our own
+			 * MIGRATE invalidation didn't clear the dmirror page
+			 * table: drop entries an earlier read left pointing at
+			 * the source pages that finalize may free.
+			 */
+			dmirror_do_update(dmirror, range->start, range->end);
+			ret = -EBUSY;
+		} else {
+			ret = __dmirror_migrate_map_locked(migrate, dmirror);
+		}
+		mutex_unlock(&dmirror->mutex);
+
+		migrate_vma_finalize(migrate);
+unlock:
+		mmap_read_unlock(dmirror->notifier.mm);
+	} while (ret == -EBUSY && !time_after(jiffies, timeout));
+
+	return ret;
+}
+
+static int dmirror_fault_and_migrate_to_device(struct dmirror *dmirror,
+					       struct hmm_dmirror_cmd *cmd)
+{
+	unsigned long start, size, end, next;
+	unsigned long *src_pfns, *dst_pfns;
+	struct migrate_vma migrate = { 0 };
+	struct hmm_range range = { 0 };
+	struct dmirror_bounce bounce;
+	int ret = 0;
+
+	/* Whole range */
+	start = cmd->addr;
+	size = cmd->npages << PAGE_SHIFT;
+	end = start + size;
+
+	if (!mmget_not_zero(dmirror->notifier.mm)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	src_pfns = kvzalloc_objs(*src_pfns, PFNS_ARRAY_SIZE,
+				 GFP_KERNEL | __GFP_NOFAIL);
+	dst_pfns = kvzalloc_objs(*dst_pfns, PFNS_ARRAY_SIZE,
+				 GFP_KERNEL | __GFP_NOFAIL);
+
+	migrate.pgmap_owner = dmirror->mdevice;
+	migrate.src = src_pfns;
+	migrate.dst = dst_pfns;
+	migrate.flags = MIGRATE_VMA_SELECT_SYSTEM;
+
+	range.migrate = &migrate;
+	range.hmm_pfns = src_pfns;
+	range.pfn_flags_mask = 0;
+	range.default_flags = HMM_PFN_REQ_FAULT | HMM_PFN_REQ_MIGRATE;
+	range.dev_private_owner = dmirror->mdevice;
+	range.notifier = &dmirror->notifier;
+
+	for (next = start; next < end; next = range.end) {
+		range.start = next;
+		range.end = min(end, next + (PFNS_ARRAY_SIZE << PAGE_SHIFT));
+
+		pr_debug("Fault and migrate range start:%#lx end:%#lx\n",
+			 range.start, range.end);
+
+		ret = do_fault_and_migrate(dmirror, &range);
+		if (ret)
+			goto out_mmput;
+	}
+
+	/*
+	 * Return the migrated data for verification.
+	 * Only for pages in device zone
+	 */
+	ret = dmirror_bounce_init(&bounce, start, size);
+	if (ret)
+		goto out_mmput;
+
+	next = start;
+	while (1) {
+		mutex_lock(&dmirror->mutex);
+		ret = dmirror_do_read(dmirror, next, end, &bounce);
+		mutex_unlock(&dmirror->mutex);
+		if (ret != -ENOENT)
+			break;
+
+		/*
+		 * Committed to device memory but not mapped after a read_retry
+		 * trip in do_fault_and_migrate(): fault it in, as a device would.
+		 */
+		next = start + (bounce.cpages << PAGE_SHIFT);
+		ret = dmirror_fault(dmirror, next, end, false);
+		if (ret)
+			break;
+	}
+	if (ret == 0 &&
+	    copy_to_user(u64_to_user_ptr(cmd->ptr), bounce.ptr, bounce.size))
+		ret = -EFAULT;
+
+	cmd->cpages = bounce.cpages;
+	dmirror_bounce_fini(&bounce);
+
+out_mmput:
+	kvfree(src_pfns);
+	kvfree(dst_pfns);
+	mmput(dmirror->notifier.mm);
+out:
+	return ret;
+}
+
 static void dmirror_mkentry(struct dmirror *dmirror, struct hmm_range *range,
 			    unsigned char *perm, unsigned long entry)
 {
@@ -1645,6 +1830,10 @@ static long dmirror_fops_unlocked_ioctl(struct file *filp,
 
 	case HMM_DMIRROR_MIGRATE_TO_DEV:
 		ret = dmirror_migrate_to_device(dmirror, &cmd);
+		break;
+
+	case HMM_DMIRROR_MIGRATE_ON_FAULT_TO_DEV:
+		ret = dmirror_fault_and_migrate_to_device(dmirror, &cmd);
 		break;
 
 	case HMM_DMIRROR_MIGRATE_TO_SYS:
