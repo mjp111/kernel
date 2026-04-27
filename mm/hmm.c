@@ -480,20 +480,28 @@ static int hmm_vma_handle_absent_pmd(struct mm_walk *walk, unsigned long start,
  * migrate_vma_split_folio() - Helper function to split a THP folio
  * @folio: the folio to split
  * @fault_page: struct page associated with the fault if any
+ * @hmm_vma_walk: walk in progress
+ * @ptep: pte_t * for unmap and unlock ptl
  *
  * Returns 0 on success
  */
 static int migrate_vma_split_folio(struct folio *folio,
-				   struct page *fault_page)
+				   struct page *fault_page,
+				   struct hmm_vma_walk *hmm_vma_walk,
+				   pte_t *ptep)
 {
 	int ret;
 	struct folio *fault_folio = fault_page ? page_folio(fault_page) : NULL;
 	struct folio *new_fault_folio = NULL;
 
-	if (folio != fault_folio) {
+	if (folio != fault_folio)
 		folio_get(folio);
+
+	pte_unmap_unlock(ptep, hmm_vma_walk->ptl);
+	hmm_vma_walk->ptelocked = false;
+
+	if (folio != fault_folio)
 		folio_lock(folio);
-	}
 
 	ret = split_folio(folio);
 	if (ret) {
@@ -703,10 +711,10 @@ static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 		if (folio_test_large(folio)) {
 			int ret;
 
-			pte_unmap_unlock(ptep, hmm_vma_walk->ptl);
-			hmm_vma_walk->ptelocked = false;
 			ret = migrate_vma_split_folio(folio,
-						      migrate->fault_page);
+						      migrate->fault_page,
+						      hmm_vma_walk,
+						      ptep);
 			if (ret)
 				goto out_error;
 			return -EAGAIN;
@@ -739,11 +747,10 @@ static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 		if (folio && folio_test_large(folio)) {
 			int ret;
 
-			pte_unmap_unlock(ptep, hmm_vma_walk->ptl);
-			hmm_vma_walk->ptelocked = false;
-
 			ret = migrate_vma_split_folio(folio,
-						      migrate->fault_page);
+						      migrate->fault_page,
+						      hmm_vma_walk,
+						      ptep);
 			if (ret)
 				goto out_error;
 			return -EAGAIN;
