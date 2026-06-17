@@ -214,15 +214,23 @@ static int hmm_vma_walk_hole(unsigned long addr, unsigned long end,
 {
 	struct hmm_vma_walk *hmm_vma_walk = walk->private;
 	struct hmm_range *range = hmm_vma_walk->range;
-	unsigned int required_fault;
+	unsigned int required_fault = 0;
+	enum migrate_vma_info minfo;
 	unsigned long i, npages;
 	unsigned long *hmm_pfns;
 
+	minfo = hmm_select_migrate(range);
 	i = (addr - range->start) >> PAGE_SHIFT;
 	npages = (end - addr) >> PAGE_SHIFT;
 	hmm_pfns = &range->hmm_pfns[i];
-	required_fault =
-		hmm_range_need_fault(hmm_vma_walk, hmm_pfns, npages, 0);
+
+	/*
+	 * We don't need to fault in holes if migrating,
+	 * the migrate path has special handling for holes.
+	 */
+	if (!minfo)
+		required_fault =
+			hmm_range_need_fault(hmm_vma_walk, hmm_pfns, npages, 0);
 	if (!walk->vma) {
 		if (required_fault)
 			return -EFAULT;
