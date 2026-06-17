@@ -938,6 +938,26 @@ static int hmm_vma_walk_split(pmd_t *pmdp,
 }
 #endif
 
+static void hmm_vma_init_mmu_notifier(unsigned long start,
+				      unsigned long end,
+				      struct vm_area_struct *vma,
+				      struct hmm_vma_walk *hmm_vma_walk)
+{
+	struct hmm_range *range = hmm_vma_walk->range;
+
+	hmm_vma_walk->vma = vma;
+	hmm_vma_walk->start = start;
+	hmm_vma_walk->end = end;
+
+	if (!hmm_vma_walk->mmu_range.owner) {
+		mmu_notifier_range_init_owner(&hmm_vma_walk->mmu_range, MMU_NOTIFY_MIGRATE, 0,
+					      vma->vm_mm, start, end,
+					      range->dev_private_owner);
+		mmu_notifier_invalidate_range_start(&hmm_vma_walk->mmu_range);
+	}
+}
+
+
 static int hmm_vma_capture_migrate_range(unsigned long start,
 					 unsigned long end,
 					 struct mm_walk *walk)
@@ -951,19 +971,12 @@ static int hmm_vma_capture_migrate_range(unsigned long start,
 	if (hmm_vma_walk->vma && (hmm_vma_walk->vma != walk->vma))
 		return -ERANGE;
 
-	hmm_vma_walk->vma = walk->vma;
-	hmm_vma_walk->start = start;
-	hmm_vma_walk->end = end;
-
+	/*
 	if (end - start > range->end - range->start)
 		return -ERANGE;
+	*/
 
-	if (!hmm_vma_walk->mmu_range.owner) {
-		mmu_notifier_range_init_owner(&hmm_vma_walk->mmu_range, MMU_NOTIFY_MIGRATE, 0,
-					      walk->vma->vm_mm, start, end,
-					      range->dev_private_owner);
-		mmu_notifier_invalidate_range_start(&hmm_vma_walk->mmu_range);
-	}
+	hmm_vma_init_mmu_notifier(start, end, walk->vma, hmm_vma_walk);
 
 	return 0;
 }
@@ -1364,6 +1377,7 @@ int hmm_range_fault(struct hmm_range *range)
 		.range = range,
 		.last = range->start,
 	};
+	struct vm_area_struct *vma;
 	struct mm_struct *mm;
 	bool is_fault_path;
 	int ret;
@@ -1377,9 +1391,16 @@ int hmm_range_fault(struct hmm_range *range)
 	 */
 #ifdef CONFIG_DEVICE_MIGRATION
 	is_fault_path = !!range->notifier;
-	mm = is_fault_path ? range->notifier->mm : range->migrate->vma->vm_mm;
+	if (is_fault_path) {
+		vma = NULL;
+		mm = range->notifier->mm;
+	} else {
+		vma = range->migrate->vma;
+		mm = vma->vm_mm;
+	}
 #else
 	is_fault_path = true;
+	vma = NULL;
 	mm = range->notifier->mm;
 #endif
 	mmap_assert_locked(mm);
@@ -1392,8 +1413,15 @@ int hmm_range_fault(struct hmm_range *range)
 			break;
 		}
 
-		ret = walk_page_range(mm, hmm_vma_walk.last, range->end,
-				      &hmm_walk_ops, &hmm_vma_walk);
+		if (!is_fault_path) {
+			hmm_vma_init_mmu_notifier(hmm_vma_walk.last, range->end,
+						  vma, &hmm_vma_walk);
+			ret = walk_page_range_vma(vma, hmm_vma_walk.last,
+						  range->end, &hmm_walk_ops, &hmm_vma_walk);
+		} else {
+			ret = walk_page_range(mm, hmm_vma_walk.last, range->end,
+					      &hmm_walk_ops, &hmm_vma_walk);
+		}
 		/*
 		 * When -EBUSY is returned the loop restarts with
 		 * hmm_vma_walk.last set to an address that has not been stored
