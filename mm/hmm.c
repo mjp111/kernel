@@ -97,7 +97,8 @@ static int hmm_pfns_fill(unsigned long addr, unsigned long end,
 	if (migrate && thp_migration_supported() &&
 	    (minfo & MIGRATE_VMA_SELECT_COMPOUND) &&
 	    IS_ALIGNED(addr, HPAGE_PMD_SIZE) &&
-	    IS_ALIGNED(end, HPAGE_PMD_SIZE)) {
+	    IS_ALIGNED(end, HPAGE_PMD_SIZE) &&
+		end-addr == HPAGE_PMD_SIZE) {
 		range->hmm_pfns[i] &= HMM_PFN_INOUT_FLAGS;
 		range->hmm_pfns[i] |= cpu_flags | HMM_PFN_COMPOUND;
 		addr += PAGE_SIZE;
