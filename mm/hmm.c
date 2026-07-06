@@ -825,7 +825,7 @@ static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 			pte = ptep_get_and_clear(mm, addr, ptep);
 		}
 
-		if (pte_dirty(pte))
+		if (pte_present(pte) && pte_dirty(pte))
 			folio_mark_dirty(folio);
 
 		/* Setup special migration page table entry */
