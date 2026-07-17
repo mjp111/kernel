@@ -40,11 +40,14 @@ struct migrate_vma;
  * On input:
  * 0                   - Return the current state of the page, do not fault it.
  * HMM_PFN_REQ_FAULT   - The output must have HMM_PFN_VALID or hmm_range_fault()
- *                       will fail
+ *                       will fail, except when migrating, which is best
+ *                       effort (see HMM_PFN_REQ_MIGRATE)
  * HMM_PFN_REQ_WRITE   - The output must have HMM_PFN_WRITE or hmm_range_fault()
  *                       will fail. Must be combined with HMM_PFN_REQ_FAULT.
  * HMM_PFN_REQ_MIGRATE - For default_flags only, request to migrate the range,
- *                       according to hmm_range.migrate.flags
+ *                       according to hmm_range.migrate.flags. Collection,
+ *                       and faulting with it, is best effort, see
+ *                       hmm_range_fault().
  */
 enum hmm_pfn_flags {
 	/* Output fields and flags */
