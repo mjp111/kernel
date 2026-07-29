@@ -948,7 +948,7 @@ static int drm_pagemap_migrate_populate_ram_pfn(struct vm_area_struct *vas,
 		 * A large source folio is always collected whole, at its head
 		 * page, PMD aligned and flagged MIGRATE_PFN_COMPOUND: anything
 		 * else is split before it reaches us, either by
-		 * migrate_vma_collect_pmd() or, for the eviction path, by
+		 * the migration collection in mm/hmm.c or, for the eviction path, by
 		 * migrate_device_pfns(). Both the order-0 fallback below and
 		 * drm_pagemap_migrate_populate_src_pages() rely on that, as
 		 * they index the folio from @i.
