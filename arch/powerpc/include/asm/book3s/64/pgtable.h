@@ -1334,7 +1334,7 @@ static inline pmd_t pmdp_huge_get_and_clear(struct mm_struct *mm,
 	 * entries. This can happen at 2 places:
 	 * - When the address space is being unmapped zap_huge_pmd(), and we
 	 *   encounter non-present pmds.
-	 * - migrate_vma_collect_huge_pmd() could calls this during migration
+	 * - hmm_vma_handle_migrate_prepare_pmd() could call this during migration
 	 *   of device-private pmd entries.
 	 */
 	if (!pmd_present(*pmdp)) {

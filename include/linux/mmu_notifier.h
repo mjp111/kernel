@@ -39,7 +39,8 @@ struct mmu_interval_notifier;
  * @MMU_NOTIFY_RELEASE: used during mmu_interval_notifier invalidate to signal
  * that the mm refcount is zero and the range is no longer accessible.
  *
- * @MMU_NOTIFY_MIGRATE: used during migrate_vma_collect() invalidate to signal
+ * @MMU_NOTIFY_MIGRATE: used during migration collection (migrate_vma_setup(),
+ * or hmm_range_fault() with HMM_PFN_REQ_MIGRATE) invalidate to signal
  * a device driver to possibly ignore the invalidation if the
  * owner field matches the driver's device private pgmap owner.
  *

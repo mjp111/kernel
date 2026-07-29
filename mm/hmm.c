@@ -1816,8 +1816,45 @@ static int hmm_range_fault_locked(struct hmm_range *range, bool *locked)
  *
  * The mmap lock must be held by the caller and will remain held on return.
  * New users should prefer hmm_range_fault_unlocked_timeout() unless they
- * specifically need to keep the mmap lock held across the call. This helper
- * cannot support VMAs whose fault handlers need to drop the mmap lock.
+ * specifically need to keep the mmap lock held across the call like while
+ * migrating. This helper cannot support VMAs whose fault handlers need to
+ * drop the mmap lock.
+ *
+ * If want to do migration after faulting, call hmm_range_fault() with
+ * range.default_flags of HMM_PFN_REQ_MIGRATE, and optionally
+ * HMM_PFN_REQ_FAULT|HMM_PFN_REQ_WRITE, and initialize range->migrate field.
+ * range->migrate->vma will be populated during the call,
+ * and must be stable across the whole migrate process, which is
+ * why mmap_lock must be held around this call.
+ *
+ * When HMM_PFN_REQ_MIGRATE is set, migration collection may be partial on
+ * return and the caller takes responsibility for completing or aborting it.
+ * Collection is then best effort: a folio that can't be locked is left as
+ * reported, and if a large folio can't be locked for splitting or can't be
+ * split, the rest of its pmd range is not walked further (not faulted or
+ * collected), even with HMM_PFN_REQ_FAULT. Entries under another migration are left 0, as
+ * waiting for them could deadlock. When faulting, a folio shared with other
+ * processes (after fork, or KSM) is not collected but left as reported (see
+ * hmm_migrate_collectable()); a write fault gives this process its own copy
+ * first. Callers check HMM_PFN_VALID and HMM_PFN_MIGRATE per entry.
+ *
+ * Other tasks' faults on collected pages wait until the migration is
+ * finalized, so the caller must not hold locks across the call that it
+ * takes again before migrate_vma_finalize().
+ *
+ * On success, the caller calls migrate_hmm_range_setup() and then either
+ * completes the migration (prepare destination pages, migrate_vma_pages(),
+ * update device mappings as needed, migrate_vma_finalize()) or aborts it as
+ * below. Either way migrate_vma_finalize() must be called.
+ *
+ * On any error, including -EBUSY, the caller must call
+ * migrate_hmm_range_setup(), migrate_vma_pages() with no valid destination
+ * entries, and migrate_vma_finalize() to abort the partial migration before
+ * retrying. A migrating call clears range->hmm_pfns on entry and does not
+ * resume a previous attempt.
+ *
+ * The mmap read lock must remain held until the migration has either been
+ * completed or aborted.
  */
 int hmm_range_fault(struct hmm_range *range)
 {

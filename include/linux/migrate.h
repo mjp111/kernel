@@ -187,6 +187,8 @@ enum migrate_vma_info {
 	MIGRATE_VMA_SELECT_DEVICE_PRIVATE = 1 << 1,
 	MIGRATE_VMA_SELECT_DEVICE_COHERENT = 1 << 2,
 	MIGRATE_VMA_SELECT_COMPOUND = 1 << 3,
+	MIGRATE_VMA_FAULT = 1 << 4,
+	MIGRATE_VMA_WRITE = 1 << 5,
 };
 
 struct migrate_vma {
@@ -224,10 +226,14 @@ struct migrate_vma {
 	struct page		*fault_page;
 };
 
-/* Migration collection in hmm_range_fault() is enabled later in the series */
 static inline enum migrate_vma_info hmm_select_migrate(struct hmm_range *range)
 {
-	return MIGRATE_VMA_SELECT_NONE;
+	enum migrate_vma_info minfo;
+
+	minfo = (range->default_flags & HMM_PFN_REQ_MIGRATE) ?
+		range->migrate->flags : 0;
+
+	return minfo;
 }
 
 static inline void *hmm_migrate_pgmap_owner(struct hmm_range *range)
