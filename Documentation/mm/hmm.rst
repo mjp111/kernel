@@ -348,6 +348,33 @@ between device driver specific code and shared common code:
    Currently only anonymous private VMA ranges can be migrated to or from
    system memory and device private memory.
 
+   By default nothing is faulted in: present pages are collected, empty
+   entries of anonymous vmas are collected as holes to be filled with new
+   pages, and pages that are not present (swapped out, or another device's
+   private pages) are skipped. Two additional flags ask migrate_vma_setup()
+   to fault in such pages first:
+
+   * ``MIGRATE_VMA_FAULT`` faults in missing pages with read access.
+   * ``MIGRATE_VMA_WRITE`` faults in missing pages with write access
+     (implies faulting), breaking any sharing first, so the device gets an
+     exclusive writable copy.
+
+   When faulting, pages shared with other processes (e.g. after fork) are
+   only collected once a write fault has given this process its own copy:
+   with ``MIGRATE_VMA_FAULT`` alone they stay in place. Device private pages
+   owned by ``args->pgmap_owner`` are never faulted, so a write fault doesn't
+   unshare them either. The faults are those the CPU would take, so empty
+   anonymous entries get system pages that are then copied, instead of being
+   collected as holes.
+
+   With either flag, a fault that fails aborts the whole range: the partial
+   collection is undone, ``args->src`` is cleared, ``args->cpages`` and
+   ``args->npages`` are zero, and migrate_vma_setup() returns the error
+   (for example ``-EFAULT`` or ``-ENOMEM``). Pages that just can't be
+   collected don't abort the range. The ``MMU_NOTIFY_MIGRATE`` invalidation
+   described below is then ended around each fault and reopened over the
+   rest of the range.
+
    One of the first steps migrate_vma_setup() does is to invalidate other
    device's MMUs with the ``mmu_notifier_invalidate_range_start()`` and
    ``mmu_notifier_invalidate_range_end()`` calls around the page table
@@ -364,11 +391,14 @@ between device driver specific code and shared common code:
    entry results in a valid "zero" PFN stored in the ``args->src`` array.
    This lets the driver allocate device private memory and clear it instead
    of copying a page of zeros. Valid PTE entries to system memory or
-   device private struct pages will be locked with ``lock_page()``, isolated
+   device private struct pages will be locked (only trylocked: a page that
+   can't be locked is not migrated), isolated
    from the LRU (if system memory since device private pages are not on
    the LRU), unmapped from the process, and a special migration PTE is
    inserted in place of the original PTE.
-   migrate_vma_setup() also clears the ``args->dst`` array.
+   migrate_vma_setup() also clears the ``args->dst`` array. It does all of
+   this through the hmm_range_fault() page table walk, see "Migration
+   collection through hmm_range_fault()" below.
 
 3. The device driver allocates destination pages and copies source pages to
    destination pages.
@@ -426,6 +456,95 @@ between device driver specific code and shared common code:
 7. ``mmap_read_unlock()``
 
    The lock can now be released.
+
+Migration collection through hmm_range_fault()
+==============================================
+
+The collection phase of migration (steps 1 and 2 above) can also be driven by
+hmm_range_fault() directly, sharing its page table walk. This lets a driver
+fault in and collect a range for migration in one walk, which is useful for
+migrate on fault.
+
+To do so, the driver sets ``HMM_PFN_REQ_MIGRATE`` in ``range->default_flags``
+and points ``range->migrate`` at a ``struct migrate_vma`` it has filled in
+(``flags``, ``src``, ``dst``, ``pgmap_owner``; ``src``, ``dst`` and
+``range->hmm_pfns`` have one entry per page of the range). ``range->notifier``
+must be set and ``range->notifier_seq`` must come from
+mmu_interval_read_begin(); hmm_range_fault() fills in ``migrate->vma``,
+``start`` and ``end``. ``migrate->flags`` needs at least one
+``MIGRATE_VMA_SELECT_*`` bit. The range must lie within a single vma, otherwise
+``-ERANGE`` is returned (``-EFAULT`` if it starts in a hole); vmas
+migrate_vma_setup() doesn't handle (not mm backed, hugetlb, DAX, shadow stack)
+get ``-EINVAL``.
+
+The mmap_read_lock() has to be held for the whole migration, since the vma
+must stay stable. hmm_range_fault_unlocked_timeout() can't be used: it fails
+without collecting anything (don't call migrate_hmm_range_setup() after it).
+
+Usually ``HMM_PFN_REQ_FAULT`` (and ``HMM_PFN_REQ_WRITE``) is set as well, so
+missing pages are faulted in before being collected. ``MIGRATE_VMA_FAULT`` and
+``MIGRATE_VMA_WRITE`` in ``migrate->flags`` have no effect here: only
+migrate_vma_setup() reads them.
+
+Migration requests come only from ``range->default_flags``:
+``range->pfn_flags_mask`` must be 0 and ``range->dev_private_owner`` must
+equal ``migrate->pgmap_owner``. ``range->hmm_pfns`` is cleared at the start of
+hmm_range_fault(), so per-pfn input, including ``HMM_PFN_INOUT_FLAGS`` such as
+``HMM_PFN_DMA_MAPPED``, is not preserved across a migrating call.
+
+hmm_range_fault() collects the entries the same way migrate_vma_setup() does,
+taking a folio reference, locking it and installing a migration PTE. Collected
+pages are marked with ``HMM_PFN_VALID | HMM_PFN_MIGRATE`` in
+``range->hmm_pfns``. When a large folio is collected whole, only its first
+entry is marked, with ``HMM_PFN_COMPOUND`` added, and the following entries are
+0, as with ``MIGRATE_PFN_COMPOUND`` in ``migrate->src``. An entry with
+``HMM_PFN_MIGRATE`` but without ``HMM_PFN_VALID`` is a collected hole (empty or
+zero page) that the driver may fill with a new page. If the page tables change
+while locks are dropped, entries collected earlier are rolled back when the
+walk visits them again; entries it doesn't revisit stay collected and are
+released by migrate_vma_pages() and migrate_vma_finalize().
+
+The ``MMU_NOTIFY_MIGRATE`` invalidation covering the collected range is ended
+while hmm_range_fault() faults pages in. As with any hmm_range_fault() use, the
+driver must check mmu_interval_read_retry() under its own lock before mapping
+the destination pages on the device, and abort the migration if it reports a
+change.
+
+Collection is best effort when migrating: a folio that can't be locked is left
+as reported, and if a large folio can't be locked for splitting or can't be
+split, the rest of its pmd range is not walked further (not faulted or
+collected), as migrate_vma_setup() does, even with ``HMM_PFN_REQ_FAULT``.
+Entries under another migration are left 0, since waiting for them while
+holding collected folios could deadlock. For the same reason, when faulting,
+only pages mapped by this process alone are collected: a page shared with other
+processes (after fork, or KSM) is left as reported. A write fault gives this
+process its own copy first, so this only leaves shared pages in place for read
+faults. That is the price of faulting in the same walk. Drivers check
+``HMM_PFN_MIGRATE`` (and ``HMM_PFN_VALID``, see above) per entry.
+
+Faults by other tasks on collected pages wait until the migration is finalized.
+The driver must therefore not hold locks across a migrating hmm_range_fault()
+call that it takes again before migrate_vma_finalize().
+
+After hmm_range_fault() returns, the driver calls::
+
+    void migrate_hmm_range_setup(struct hmm_range *range);
+
+to translate ``range->hmm_pfns`` into ``migrate->src[]`` (``migrate->dst[]`` is
+zeroed), initialize ``migrate->cpages`` and ``migrate->npages``, and unmap the
+collected pages as migrate_vma_setup() does (migrate_vma_unmap()). From here on
+the ``range->migrate`` struct is ready for the rest of the flow (steps 3
+onwards): the driver either completes the migration or aborts it as below,
+and either way calls migrate_vma_pages() and migrate_vma_finalize().
+
+migrate_hmm_range_setup() must be called even when hmm_range_fault() fails,
+since it may have collected part of the range before failing. On any error,
+including ``-EBUSY``, the driver then aborts the partial migration: it skips
+step 3, so ``migrate->dst[]`` stays zeroed, and calls migrate_vma_pages() and
+migrate_vma_finalize(), which restore the original PTEs and release the
+collected folios. A migrating call does not resume a previous attempt, so
+the previous one, completed or aborted, must be finished before calling
+hmm_range_fault() again.
 
 Exclusive access memory
 =======================
