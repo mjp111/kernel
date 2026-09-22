@@ -1005,7 +1005,8 @@ static int dmirror_atomic_map(unsigned long addr, struct page *page,
 }
 
 static int dmirror_migrate_finalize_and_map(struct migrate_vma *args,
-					    struct dmirror *dmirror)
+					    struct dmirror *dmirror,
+					    unsigned long seq)
 {
 	unsigned long start = args->start;
 	unsigned long end = args->end;
@@ -1017,6 +1018,19 @@ static int dmirror_migrate_finalize_and_map(struct migrate_vma *args,
 
 	/* Map the migrated pages into the device's page tables. */
 	mutex_lock(&dmirror->mutex);
+
+	/*
+	 * If the interval notifier fired since @seq was sampled, the migration
+	 * entries may have been zapped (e.g. by a concurrent MADV_DONTNEED,
+	 * which only needs the mmap read lock) and the pages about to be mapped
+	 * will be freed by migrate_vma_finalize(). Don't install stale entries:
+	 * the colliding invalidation either ran before us and is caught here, or
+	 * runs after us and clears our entries under the same mutex.
+	 */
+	if (mmu_interval_read_retry(&dmirror->notifier, seq)) {
+		mutex_unlock(&dmirror->mutex);
+		return -EBUSY;
+	}
 
 	for (pfn = start_pfn; pfn < end_pfn; pfn++, src++, dst++) {
 		struct page *dpage;
@@ -1308,6 +1322,7 @@ static int dmirror_migrate_to_device(struct dmirror *dmirror,
 	struct dmirror_bounce bounce;
 	struct migrate_vma args = { 0 };
 	unsigned long next;
+	unsigned long seq;
 	int ret;
 	unsigned long *src_pfns = NULL;
 	unsigned long *dst_pfns = NULL;
@@ -1338,6 +1353,8 @@ static int dmirror_migrate_to_device(struct dmirror *dmirror,
 		if (next > vma->vm_end)
 			next = vma->vm_end;
 
+		seq = mmu_interval_read_begin(&dmirror->notifier);
+
 		args.vma = vma;
 		args.src = src_pfns;
 		args.dst = dst_pfns;
@@ -1353,8 +1370,10 @@ static int dmirror_migrate_to_device(struct dmirror *dmirror,
 		pr_debug("Migrating from sys mem to device mem\n");
 		dmirror_migrate_alloc_and_copy(&args, dmirror);
 		migrate_vma_pages(&args);
-		dmirror_migrate_finalize_and_map(&args, dmirror);
+		ret = dmirror_migrate_finalize_and_map(&args, dmirror, seq);
 		migrate_vma_finalize(&args);
+		if (ret)
+			goto out;
 	}
 	mmap_read_unlock(mm);
 	mmput(mm);
@@ -1416,7 +1435,8 @@ static int do_fault_and_migrate(struct dmirror *dmirror, struct hmm_range *range
 
 	dmirror_migrate_alloc_and_copy(migrate, dmirror);
 	migrate_vma_pages(migrate);
-	dmirror_migrate_finalize_and_map(migrate, dmirror);
+	ret = dmirror_migrate_finalize_and_map(migrate, dmirror,
+					       range->notifier_seq);
 	migrate_vma_finalize(migrate);
 out:
 	mmap_read_unlock(dmirror->notifier.mm);
