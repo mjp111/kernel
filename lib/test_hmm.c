@@ -1004,8 +1004,12 @@ static int dmirror_atomic_map(unsigned long addr, struct page *page,
 	return 0;
 }
 
-static int dmirror_migrate_finalize_and_map(struct migrate_vma *args,
-					    struct dmirror *dmirror)
+/*
+ * Map the migrated pages into the device's page table. Caller must hold
+ * dmirror->mutex.
+ */
+static int __dmirror_migrate_map_locked(struct migrate_vma *args,
+					struct dmirror *dmirror)
 {
 	unsigned long start = args->start;
 	unsigned long end = args->end;
@@ -1014,9 +1018,6 @@ static int dmirror_migrate_finalize_and_map(struct migrate_vma *args,
 	unsigned long pfn;
 	const unsigned long start_pfn = start >> PAGE_SHIFT;
 	const unsigned long end_pfn = end >> PAGE_SHIFT;
-
-	/* Map the migrated pages into the device's page tables. */
-	mutex_lock(&dmirror->mutex);
 
 	for (pfn = start_pfn; pfn < end_pfn; pfn++, src++, dst++) {
 		struct page *dpage;
@@ -1046,15 +1047,25 @@ static int dmirror_migrate_finalize_and_map(struct migrate_vma *args,
 			if (*dst & MIGRATE_PFN_WRITE)
 				entry = xa_tag_pointer(entry, DPT_XA_TAG_WRITE);
 			entry = xa_store(&dmirror->pt, pfn + i, entry, GFP_ATOMIC);
-			if (xa_is_err(entry)) {
-				mutex_unlock(&dmirror->mutex);
+			if (xa_is_err(entry))
 				return xa_err(entry);
-			}
 		}
 	}
 
-	mutex_unlock(&dmirror->mutex);
 	return 0;
+}
+
+static int dmirror_migrate_finalize_and_map(struct migrate_vma *args,
+					    struct dmirror *dmirror)
+{
+	int ret;
+
+	/* Map the migrated pages into the device's page tables. */
+	mutex_lock(&dmirror->mutex);
+	ret = __dmirror_migrate_map_locked(args, dmirror);
+	mutex_unlock(&dmirror->mutex);
+
+	return ret;
 }
 
 static int dmirror_exclusive(struct dmirror *dmirror,
@@ -1390,36 +1401,65 @@ free_mem:
 static int do_fault_and_migrate(struct dmirror *dmirror, struct hmm_range *range)
 {
 	struct migrate_vma *migrate = range->migrate;
+	unsigned long timeout =
+		jiffies + msecs_to_jiffies(HMM_RANGE_DEFAULT_TIMEOUT);
 	int ret;
 
-	mmap_read_lock(dmirror->notifier.mm);
-
-	/* Fault-in pages for migration */
-	ret = dmirror_range_fault(dmirror, range);
 	/*
-	 * Set this up even on error: hmm_range_fault() may have collected
-	 * part of the range before failing.
+	 * This models a device fault, so it must make forward progress rather
+	 * than fail on a transient collision. If the range is invalidated while
+	 * migrating (e.g. by a concurrent MADV_DONTNEED, which only needs the
+	 * mmap read lock), redo the whole collect-and-migrate cycle for the
+	 * range until it settles or the timeout expires.
 	 */
-	migrate_hmm_range_setup(range);
-	if (ret) {
+	do {
+		mmap_read_lock(dmirror->notifier.mm);
+
+		/* Fault-in pages for migration */
+		ret = dmirror_range_fault(dmirror, range);
 		/*
-		 * dst[] entries are empty, so this marks every collected migration
-		 * as failed. finalize then restores the source mappings and drops
-		 * the associated locks/references.
+		 * Set this up even on error: hmm_range_fault() may have collected
+		 * part of the range before failing.
 		 */
+		migrate_hmm_range_setup(range);
+		if (ret) {
+			/*
+			 * dst[] entries are empty, so this marks every collected
+			 * migration as failed. finalize then restores the source
+			 * mappings and drops the associated locks/references.
+			 */
+			migrate_vma_pages(migrate);
+			migrate_vma_finalize(migrate);
+			goto unlock;
+		}
+
+		pr_debug("Migrating from sys mem to device mem\n");
+
+		dmirror_migrate_alloc_and_copy(migrate, dmirror);
 		migrate_vma_pages(migrate);
+
+		/*
+		 * dmirror->pt holds no page references and relies on the mmu
+		 * interval notifier to clear stale entries. If the notifier
+		 * fired since the range was collected, the migration entries may
+		 * have been zapped and the pages about to be mapped will be freed
+		 * by migrate_vma_finalize(); don't install stale entries. Redo
+		 * the range instead (below). The check is under dmirror->mutex so
+		 * it is serialized against the invalidate callback.
+		 */
+		mutex_lock(&dmirror->mutex);
+		if (mmu_interval_read_retry(&dmirror->notifier,
+					    range->notifier_seq))
+			ret = -EBUSY;
+		else
+			ret = __dmirror_migrate_map_locked(migrate, dmirror);
+		mutex_unlock(&dmirror->mutex);
+
 		migrate_vma_finalize(migrate);
-		goto out;
-	}
+unlock:
+		mmap_read_unlock(dmirror->notifier.mm);
+	} while (ret == -EBUSY && !time_after(jiffies, timeout));
 
-	pr_debug("Migrating from sys mem to device mem\n");
-
-	dmirror_migrate_alloc_and_copy(migrate, dmirror);
-	migrate_vma_pages(migrate);
-	dmirror_migrate_finalize_and_map(migrate, dmirror);
-	migrate_vma_finalize(migrate);
-out:
-	mmap_read_unlock(dmirror->notifier.mm);
 	return ret;
 }
 
