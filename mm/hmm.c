@@ -508,32 +508,26 @@ static int hmm_vma_handle_absent_pmd(struct mm_walk *walk, unsigned long start,
 
 #ifdef CONFIG_DEVICE_MIGRATION
 /**
- * migrate_vma_split_folio() - Helper function to split a THP folio
+ * __migrate_vma_split_folio() - split a folio and move the lock/ref to the
+ * order-0 folio backing @fault_page after the split
  * @folio: the folio to split
  * @fault_page: struct page associated with the fault if any
- * @hmm_vma_walk: walk in progress
- * @ptep: pte_t * for unmap and unlock ptl
  *
- * Returns 0 on success
+ * Caller must hold a reference on @folio and, unless @folio is the folio
+ * backing @fault_page, the folio lock. Any page-table lock must already be
+ * dropped. On success the order-0 folio backing @fault_page (if any) is left
+ * locked and referenced, handling the case where @fault_page was a tail page.
+ * On failure @folio is unlocked and put, except when it is the fault folio,
+ * which the caller still owns.
+ *
+ * Returns 0 on success.
  */
-static int migrate_vma_split_folio(struct folio *folio,
-				   struct page *fault_page,
-				   struct hmm_vma_walk *hmm_vma_walk,
-				   pte_t *ptep)
+static int __migrate_vma_split_folio(struct folio *folio,
+				     struct page *fault_page)
 {
-	int ret;
 	struct folio *fault_folio = fault_page ? page_folio(fault_page) : NULL;
 	struct folio *new_fault_folio = NULL;
-
-	if (folio != fault_folio)
-		folio_get(folio);
-
-	lazy_mmu_mode_disable();
-	pte_unmap_unlock(ptep, hmm_vma_walk->ptl);
-	hmm_vma_walk->ptelocked = false;
-
-	if (folio != fault_folio)
-		folio_lock(folio);
+	int ret;
 
 	ret = split_folio(folio);
 	if (ret) {
@@ -563,6 +557,35 @@ static int migrate_vma_split_folio(struct folio *folio,
 	}
 
 	return 0;
+}
+
+/**
+ * migrate_vma_split_folio() - drop the pte lock and split a THP folio
+ * @folio: the folio to split
+ * @fault_page: struct page associated with the fault if any
+ * @hmm_vma_walk: walk in progress
+ * @ptep: pte_t * for unmap and unlock ptl
+ *
+ * Returns 0 on success
+ */
+static int migrate_vma_split_folio(struct folio *folio,
+				   struct page *fault_page,
+				   struct hmm_vma_walk *hmm_vma_walk,
+				   pte_t *ptep)
+{
+	struct folio *fault_folio = fault_page ? page_folio(fault_page) : NULL;
+
+	if (folio != fault_folio)
+		folio_get(folio);
+
+	lazy_mmu_mode_disable();
+	pte_unmap_unlock(ptep, hmm_vma_walk->ptl);
+	hmm_vma_walk->ptelocked = false;
+
+	if (folio != fault_folio)
+		folio_lock(folio);
+
+	return __migrate_vma_split_folio(folio, fault_page);
 }
 
 /*
@@ -688,25 +711,43 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 		r = set_pmd_migration_entry(&pvmw, folio_page(folio, 0));
 		if (r) {
 			hmm_pfn[0] &= ~(HMM_PFN_MIGRATE | HMM_PFN_COMPOUND);
-			r = -ENOENT;  // fallback
-			goto unlock_out;
+			goto split;	/* fall back to splitting the pmd */
 		}
 		for (i = 1, start += PAGE_SIZE; start < end; start += PAGE_SIZE, i++)
 			hmm_pfn[i] &= HMM_PFN_INOUT_FLAGS;
 
 	} else {
-		r = -ENOENT;  // fallback
-		goto unlock_out;
+		goto split;		/* fall back to splitting the pmd */
 	}
 
 out:
 	return r;
 
-unlock_out:
-	if (folio != fault_folio)
-		folio_unlock(folio);
-	folio_put(folio);
-	goto out;
+split:
+	/*
+	 * Split the huge pmd here, while we hold the folio (locked, unless it
+	 * is the caller's fault folio) and the pmd lock, then re-walk the range
+	 * as individual PTEs. Doing the split in place avoids dropping and
+	 * re-taking these locks, which would race with a concurrent split.
+	 * split_folio() needs the pmd lock dropped.
+	 */
+	spin_unlock(hmm_vma_walk->ptl);
+	hmm_vma_walk->pmdlocked = false;
+
+	/*
+	 * folio_get() above took an extra reference. For the fault folio the
+	 * caller still holds a reference and the lock, which is the
+	 * precondition of __migrate_vma_split_folio(), so drop the extra one.
+	 */
+	if (folio == fault_folio)
+		folio_put(folio);
+
+	r = __migrate_vma_split_folio(folio, migrate->fault_page);
+	if (r)
+		return r;
+
+	hmm_vma_walk->last = start;
+	return -EBUSY;
 }
 
 /*
@@ -1184,16 +1225,16 @@ again:
 			hmm_vma_walk->pmdlocked = false;
 		}
 
-		if (r == -ENOENT) {
-			r = hmm_vma_walk_split(pmdp, addr, walk);
-			if (r) {
-				/* Split not successful, skip */
-				return hmm_pfns_fill(start, end, hmm_vma_walk, HMM_PFN_ERROR);
-			}
-
-			/* Split successful, reloop */
-			hmm_vma_walk->last = addr;
+		/*
+		 * hmm_vma_handle_migrate_prepare_pmd() splits the huge pmd in
+		 * place when needed and returns -EBUSY to re-walk the range as
+		 * PTEs; any other error means the split failed.
+		 */
+		if (r == -EBUSY)
 			return -EBUSY;
+		if (r) {
+			/* Split not successful, skip */
+			return hmm_pfns_fill(start, end, hmm_vma_walk, HMM_PFN_ERROR);
 		}
 		return r;
 
