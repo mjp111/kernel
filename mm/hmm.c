@@ -1238,6 +1238,14 @@ again:
 		r = hmm_vma_handle_pte(walk, addr, end, pmdp, ptep, hmm_pfns);
 		if (r) {
 			/* hmm_vma_handle_pte() did pte_unmap() / pte_unmap_unlock */
+			/*
+			 * Flush TLB for any PTEs unmapped by
+			 * hmm_vma_handle_migrate_prepare() in earlier iterations,
+			 * otherwise the re-walk restarts past [start, addr) and
+			 * those entries are never flushed.
+			 */
+			if (unmapped)
+				flush_tlb_range(walk->vma, start, addr);
 			return r;
 		}
 
