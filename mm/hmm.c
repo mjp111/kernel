@@ -1030,13 +1030,19 @@ static int hmm_vma_capture_migrate_range(unsigned long start,
 		return -ERANGE;
 
 	hmm_vma_walk->vma = walk->vma;
-	hmm_vma_walk->start = start;
-	hmm_vma_walk->end = end;
 
 	if (end - start > range->end - range->start)
 		return -ERANGE;
 
+	/*
+	 * Capture the migration span and arm the invalidation only on the
+	 * first walk.  On an -EBUSY retry the outer loop restarts the walk
+	 * from an intermediate faulting address, so overwriting start here
+	 * would truncate the tracked range fed to hmm_fill_migrate_vma().
+	 */
 	if (!hmm_vma_walk->mmu_range.owner) {
+		hmm_vma_walk->start = start;
+		hmm_vma_walk->end = end;
 		mmu_notifier_range_init_owner(&hmm_vma_walk->mmu_range, MMU_NOTIFY_MIGRATE, 0,
 					      walk->vma->vm_mm, start, end,
 					      range->dev_private_owner);
