@@ -916,10 +916,14 @@ nouveau_svm_fault(struct work_struct *work)
 			ret = nouveau_range_fault_and_migrate(svmm, svm->drm,
 							      args, hmm_flags,
 							      &notifier);
-			if (ret)
+			if (ret) {
+				SVM_DBG(svm,
+					"migrate-on-fault %016llx fell back (%d)",
+					buffer->fault[fi]->addr, ret);
 				ret = nouveau_range_fault(svmm, svm->drm, args,
 							  __struct_size(args),
 							  hmm_flags, &notifier);
+			}
 		} else {
 			ret = nouveau_range_fault(svmm, svm->drm, args,
 						  __struct_size(args),

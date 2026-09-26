@@ -894,6 +894,7 @@ nouveau_dmem_migrate_fault(struct nouveau_drm *drm, struct nouveau_svmm *svmm,
 		.default_flags		= hmm_flags | HMM_PFN_REQ_MIGRATE,
 	};
 	unsigned long nr_dma, order, n;
+	unsigned long attempts = 0, sel = 0, mig = 0, i;
 	u64 *pfns;
 	int ret;
 
@@ -923,6 +924,7 @@ nouveau_dmem_migrate_fault(struct nouveau_drm *drm, struct nouveau_svmm *svmm,
 	range.hmm_pfns = migrate.src;
 
 	do {
+		attempts++;
 		mmap_read_lock(mm);
 		range.notifier_seq = mmu_interval_read_begin(notifier);
 
@@ -937,6 +939,15 @@ nouveau_dmem_migrate_fault(struct nouveau_drm *drm, struct nouveau_svmm *svmm,
 		n = nouveau_dmem_migrate_alloc_and_copy(drm, svmm, &migrate,
 							dma_info, pfns,
 							&nr_dma, &order);
+
+		/* debug: count pages selected for and actually migrated */
+		sel = mig = 0;
+		for (i = 0; i < npages; i++) {
+			if (migrate.src[i] & MIGRATE_PFN_MIGRATE)
+				sel++;
+			if (migrate.dst[i])
+				mig++;
+		}
 
 		nouveau_fence_new(&fence, drm->dmem->migrate.chan);
 		migrate_vma_pages(&migrate);
@@ -966,6 +977,11 @@ unlock:
 	 */
 	if (!ret && !(pfns[0] & NVIF_VMM_PFNMAP_V0_V))
 		ret = -ENOENT;
+
+	NV_INFO(drm,
+		"svm: migrate_fault %lx-%lx: %lu attempt(s), selected %lu, migrated %lu, ret %d%s\n",
+		start, end, attempts, sel, mig, ret,
+		ret == -ENOENT ? " (fall back to map-in-place)" : "");
 
 	nouveau_pfns_free(pfns);
 out_free_dma:
