@@ -40,6 +40,9 @@
 #include <linux/hmm.h>
 #include <linux/memremap.h>
 #include <linux/migrate.h>
+#include <linux/jiffies.h>
+#include <linux/delay.h>
+#include <linux/mmu_notifier.h>
 
 /*
  * FIXME: this is ugly right now we are using TTM to allocate vram and we pin
@@ -139,10 +142,12 @@ static void nouveau_dmem_folio_free(struct folio *folio)
 	spin_unlock(&dmem->lock);
 }
 
-static void nouveau_dmem_fence_done(struct nouveau_fence **fence)
+static int nouveau_dmem_fence_done(struct nouveau_fence **fence)
 {
+	int ret = 0;
+
 	if (fence) {
-		nouveau_fence_wait(*fence, true, false);
+		ret = nouveau_fence_wait(*fence, true, false);
 		nouveau_fence_unref(fence);
 	} else {
 		/*
@@ -150,6 +155,13 @@ static void nouveau_dmem_fence_done(struct nouveau_fence **fence)
 		 * the hmem object.
 		 */
 	}
+
+	/*
+	 * nouveau_fence_wait() returns 0 on completion, -EBUSY on the 15s
+	 * timeout, or another negative errno. Propagate it so migrate-on-fault
+	 * callers can avoid committing/mapping a copy that never finished.
+	 */
+	return ret;
 }
 
 static int nouveau_dmem_copy_folio(struct nouveau_drm *drm,
@@ -188,7 +200,7 @@ static vm_fault_t nouveau_dmem_migrate_to_ram(struct vm_fault *vmf)
 	struct nouveau_svmm *svmm;
 	struct page *dpage;
 	vm_fault_t ret = 0;
-	int err;
+	int err, fret = 0;
 	struct migrate_vma args = {
 		.vma		= vmf->vma,
 		.pgmap_owner	= drm->dev,
@@ -266,9 +278,39 @@ static vm_fault_t nouveau_dmem_migrate_to_ram(struct vm_fault *vmf)
 
 	nouveau_fence_new(&fence, dmem->migrate.chan);
 	migrate_vma_pages(&args);
-	nouveau_dmem_fence_done(&fence);
+	/*
+	 * Poll the readback copy fence directly rather than taking the lazy
+	 * (interrupt-driven) fence wait. On the shared migrate/CE channel the
+	 * non-stall copy-completion interrupt is intermittently not delivered
+	 * under sustained migration: the VRAM->sysram copy completes in HW
+	 * within a couple of milliseconds, but the fence is not signalled until
+	 * the next channel emit happens to poll it, so an interrupt-driven wait
+	 * would sit here for the full ~15s fence timeout even though the GPU is
+	 * otherwise idle. nouveau_fence_done() forces nouveau_fence_update() to
+	 * read the CE semaphore directly, which observes completion promptly.
+	 */
+	{
+		unsigned long deadline = jiffies + 30 * HZ;
+
+		while (!nouveau_fence_done(fence)) {
+			if (time_after(jiffies, deadline)) {
+				fret = -EBUSY;
+				break;
+			}
+			msleep(1);
+		}
+		nouveau_fence_unref(&fence);
+	}
 	dma_unmap_page(drm->dev->dev, dma_info.dma_addr, dma_info.size,
 				DMA_BIDIRECTIONAL);
+	if (fret)
+		/*
+		 * The copy did not complete (timeout/error). migrate_vma_pages()
+		 * has already swapped the pte to the sysram page, which may hold
+		 * stale/uncopied data -- fail the fault loudly instead of letting
+		 * the app silently consume it.
+		 */
+		ret = VM_FAULT_SIGBUS;
 done:
 	migrate_vma_finalize(&args);
 err:
@@ -794,11 +836,18 @@ out:
 	return 0;
 }
 
-static void nouveau_dmem_migrate_chunk(struct nouveau_drm *drm,
+/*
+ * Allocate device pages for and copy into them the migratable source pages
+ * described by @args. Fills the GPU pfn array @pfns and the DMA unmap
+ * descriptors @dma_info. Returns the number of source pages processed, and
+ * reports the number of DMA mappings and the largest folio order seen.
+ */
+static unsigned long
+nouveau_dmem_migrate_alloc_and_copy(struct nouveau_drm *drm,
 		struct nouveau_svmm *svmm, struct migrate_vma *args,
-		struct nouveau_dmem_dma_info *dma_info, u64 *pfns)
+		struct nouveau_dmem_dma_info *dma_info, u64 *pfns,
+		unsigned long *nr_dma_out, unsigned long *order_out)
 {
-	struct nouveau_fence *fence;
 	unsigned long addr = args->start, nr_dma = 0, i;
 	unsigned long order = 0;
 
@@ -820,6 +869,21 @@ static void nouveau_dmem_migrate_chunk(struct nouveau_drm *drm,
 		addr += (1 << order) * PAGE_SIZE;
 	}
 
+	*nr_dma_out = nr_dma;
+	*order_out = order;
+	return i;
+}
+
+static void nouveau_dmem_migrate_chunk(struct nouveau_drm *drm,
+		struct nouveau_svmm *svmm, struct migrate_vma *args,
+		struct nouveau_dmem_dma_info *dma_info, u64 *pfns)
+{
+	struct nouveau_fence *fence;
+	unsigned long nr_dma, order, i;
+
+	i = nouveau_dmem_migrate_alloc_and_copy(drm, svmm, args, dma_info, pfns,
+						&nr_dma, &order);
+
 	nouveau_fence_new(&fence, drm->dmem->migrate.chan);
 	migrate_vma_pages(args);
 	nouveau_dmem_fence_done(&fence);
@@ -830,6 +894,157 @@ static void nouveau_dmem_migrate_chunk(struct nouveau_drm *drm,
 				dma_info[nr_dma].size, DMA_BIDIRECTIONAL);
 	}
 	migrate_vma_finalize(args);
+}
+
+/*
+ * Experimental: fault a range in and migrate it to VRAM in a single
+ * hmm_range_fault() walk, driven by HMM_PFN_REQ_MIGRATE. Mirrors the
+ * test_hmm do_fault_and_migrate() loop: hold mmap_read_lock across the whole
+ * sequence, and program the GPU page tables under svmm->mutex only if the
+ * range was not invalidated since the walk, retrying on collision.
+ *
+ * The window is a single page for now; widening it to the fault's compound
+ * folio is a follow-up. Returns 0 if the faulting page was migrated and
+ * mapped, or an error so the caller can fall back to mapping in place.
+ */
+int
+nouveau_dmem_migrate_fault(struct nouveau_drm *drm, struct nouveau_svmm *svmm,
+			   struct mmu_interval_notifier *notifier,
+			   unsigned long start, unsigned long end,
+			   unsigned long hmm_flags)
+{
+	unsigned long timeout =
+		jiffies + msecs_to_jiffies(HMM_RANGE_DEFAULT_TIMEOUT);
+	unsigned long npages = (end - start) >> PAGE_SHIFT;
+	struct mm_struct *mm = notifier->mm;
+	struct nouveau_dmem_dma_info *dma_info;
+	struct nouveau_fence *fence;
+	struct migrate_vma migrate = {
+		.start		= start,
+		.end		= end,
+		.pgmap_owner	= drm->dev,
+		.flags		= MIGRATE_VMA_SELECT_SYSTEM,
+	};
+	struct hmm_range range = {
+		.notifier		= notifier,
+		.start			= start,
+		.end			= end,
+		.dev_private_owner	= drm->dev,
+		.migrate		= &migrate,
+		.default_flags		= hmm_flags | HMM_PFN_REQ_MIGRATE,
+	};
+	unsigned long nr_dma, order, n;
+	u64 *pfns;
+	int ret, fret = 0;
+
+	if (!drm->dmem)
+		return -ENODEV;
+
+	migrate.src = kcalloc(npages, sizeof(*migrate.src), GFP_KERNEL);
+	if (!migrate.src)
+		return -ENOMEM;
+	migrate.dst = kcalloc(npages, sizeof(*migrate.dst), GFP_KERNEL);
+	if (!migrate.dst) {
+		ret = -ENOMEM;
+		goto out_free_src;
+	}
+	dma_info = kmalloc_objs(*dma_info, npages);
+	if (!dma_info) {
+		ret = -ENOMEM;
+		goto out_free_dst;
+	}
+	pfns = nouveau_pfns_alloc(npages);
+	if (!pfns) {
+		ret = -ENOMEM;
+		goto out_free_dma;
+	}
+
+	/* hmm_range_fault() shares the source pfn array with migrate_vma. */
+	range.hmm_pfns = migrate.src;
+
+	do {
+		mmap_read_lock(mm);
+		range.notifier_seq = mmu_interval_read_begin(notifier);
+
+		ret = hmm_range_fault(&range);
+		migrate_hmm_range_setup(&range);
+		if (ret) {
+			migrate_vma_pages(&migrate);
+			migrate_vma_finalize(&migrate);
+			goto unlock;
+		}
+
+		n = nouveau_dmem_migrate_alloc_and_copy(drm, svmm, &migrate,
+							dma_info, pfns,
+							&nr_dma, &order);
+
+		nouveau_fence_new(&fence, drm->dmem->migrate.chan);
+		migrate_vma_pages(&migrate);
+
+		/*
+		 * Break the migrate-on-fault deadlock: replay the faulting
+		 * channel BEFORE waiting for the migrate copy to complete. The
+		 * copy runs on the CE (migrate) channel, but it cannot make
+		 * progress while the faulting channel is stalled on this same,
+		 * still-unreplayed fault -- so a synchronous wait here would
+		 * block until the copy fence hits its ~15s timeout and the
+		 * channel gets killed (CTXSW_TIMEOUT). The just-migrated page is
+		 * not mapped in the GPU yet, so the replayed access simply
+		 * re-faults (harmless: replayable) until we program the VRAM
+		 * mapping below and the fault handler issues its final replay.
+		 */
+		if (drm->svm)
+			nouveau_svm_fault_replay(drm->svm);
+
+		fret = nouveau_dmem_fence_done(&fence);
+
+		mutex_lock(&svmm->mutex);
+		if (fret) {
+			/*
+			 * The copy did not complete (timeout or error). Do not
+			 * map the VRAM page -- it may be half-copied. Report an
+			 * error so the caller maps in place and does not leave a
+			 * stale/partial GPU mapping behind.
+			 */
+			ret = -EIO;
+		} else if (mmu_interval_read_retry(notifier, range.notifier_seq)) {
+			ret = -EBUSY;
+		} else {
+			__nouveau_pfns_map_locked(svmm, migrate.start, pfns, n,
+						  PAGE_SHIFT + order);
+		}
+		mutex_unlock(&svmm->mutex);
+
+		if (fret)
+			NV_ERROR(drm,
+				 "svm: migrate copy did not complete (%d) for %lx-%lx\n",
+				 fret, start, end);
+
+		while (nr_dma--) {
+			dma_unmap_page(drm->dev->dev, dma_info[nr_dma].dma_addr,
+				       dma_info[nr_dma].size, DMA_BIDIRECTIONAL);
+		}
+		migrate_vma_finalize(&migrate);
+unlock:
+		mmap_read_unlock(mm);
+	} while (ret == -EBUSY && !time_after(jiffies, timeout));
+
+	/*
+	 * If the faulting page was not migrated (e.g. it is already resident in
+	 * VRAM, or could not be migrated), report an error so the caller maps
+	 * the range in place instead.
+	 */
+	if (!ret && !(pfns[0] & NVIF_VMM_PFNMAP_V0_V))
+		ret = -ENOENT;
+
+	nouveau_pfns_free(pfns);
+out_free_dma:
+	kfree(dma_info);
+out_free_dst:
+	kfree(migrate.dst);
+out_free_src:
+	kfree(migrate.src);
+	return ret;
 }
 
 int
