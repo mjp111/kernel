@@ -219,6 +219,9 @@ static int nouveau_dmem_copy_folio(struct nouveau_drm *drm,
 	return 0;
 }
 
+/* debug: cumulative migrate-on-fault tally (throwaway instrumentation) */
+static unsigned long dbg_fault_calls, dbg_migrations, dbg_resident_refaults;
+
 static vm_fault_t nouveau_dmem_migrate_to_ram(struct vm_fault *vmf)
 {
 	struct nouveau_drm *drm = page_to_drm(vmf->page);
@@ -228,6 +231,7 @@ static vm_fault_t nouveau_dmem_migrate_to_ram(struct vm_fault *vmf)
 	struct page *dpage;
 	vm_fault_t ret = 0;
 	int err, fret = 0;
+	unsigned long cpages = 0, moved = 0, waited_ms = 0;
 	struct migrate_vma args = {
 		.vma		= vmf->vma,
 		.pgmap_owner	= drm->dev,
@@ -272,10 +276,13 @@ static vm_fault_t nouveau_dmem_migrate_to_ram(struct vm_fault *vmf)
 	 * than just one page on CPU fault. When such fault happens it is very
 	 * likely that more surrounding page will CPU fault too.
 	 */
-	if (migrate_vma_setup(&args) < 0)
-		return VM_FAULT_SIGBUS;
+	if (migrate_vma_setup(&args) < 0) {
+		ret = VM_FAULT_SIGBUS;
+		goto err;
+	}
+	cpages = args.cpages;
 	if (!args.cpages)
-		return 0;
+		goto err;
 
 	if (order)
 		dpage = folio_page(vma_alloc_folio(GFP_HIGHUSER | __GFP_ZERO,
@@ -305,7 +312,16 @@ static vm_fault_t nouveau_dmem_migrate_to_ram(struct vm_fault *vmf)
 
 	nouveau_fence_new(&fence, dmem->migrate.chan);
 	migrate_vma_pages(&args);
-	fret = nouveau_dmem_fence_poll(&fence);
+	/* debug: record how long the readback copy actually took (waited_ms) */
+	{
+		unsigned long start_j = jiffies;
+
+		fret = nouveau_dmem_fence_poll(&fence);
+		waited_ms = jiffies_to_msecs(jiffies - start_j);
+	}
+	/* debug: MIGRATE_PFN_MIGRATE stays set only for pages moved back. */
+	if (args.src[0] & MIGRATE_PFN_MIGRATE)
+		moved = 1;
 	dma_unmap_page(drm->dev->dev, dma_info.dma_addr, dma_info.size,
 				DMA_BIDIRECTIONAL);
 	if (fret)
@@ -314,6 +330,11 @@ static vm_fault_t nouveau_dmem_migrate_to_ram(struct vm_fault *vmf)
 done:
 	migrate_vma_finalize(&args);
 err:
+	/* debug: distinguish a wedged copy (fret != 0) from a migrate-back livelock. */
+	NV_INFO(drm,
+		"svm: migrate_to_ram %lx: cpages %lu, copy fret %d, waited %lums, moved %lu, ret %d [tally: fault_calls %lu, migrations %lu, resident_refaults %lu]\n",
+		vmf->address, cpages, fret, waited_ms, moved, (int)ret,
+		dbg_fault_calls, dbg_migrations, dbg_resident_refaults);
 	kfree(args.src);
 	kfree(args.dst);
 	return ret;
@@ -970,6 +991,7 @@ nouveau_dmem_migrate_fault(struct nouveau_drm *drm, struct nouveau_svmm *svmm,
 		.default_flags		= hmm_flags | HMM_PFN_REQ_MIGRATE,
 	};
 	unsigned long nr_dma, order, n, i;
+	unsigned long attempts = 0, sel = 0, mig = 0;
 	unsigned long hmm_pfn0 = 0;
 	bool migrated;
 	u64 *pfns;
@@ -1001,6 +1023,7 @@ nouveau_dmem_migrate_fault(struct nouveau_drm *drm, struct nouveau_svmm *svmm,
 	range.hmm_pfns = migrate.src;
 
 	do {
+		attempts++;
 		mmap_read_lock(mm);
 		range.notifier_seq = mmu_interval_read_begin(notifier);
 
@@ -1023,10 +1046,13 @@ nouveau_dmem_migrate_fault(struct nouveau_drm *drm, struct nouveau_svmm *svmm,
 							&nr_dma, &order);
 
 		/* Only a migrated page has an in-flight CE copy to unblock below. */
+		sel = mig = 0; /* debug tally */
 		for (i = 0, migrated = false; i < npages; i++) {
+			if (migrate.src[i] & MIGRATE_PFN_MIGRATE)
+				sel++;
 			if (migrate.dst[i]) {
+				mig++;
 				migrated = true;
-				break;
 			}
 		}
 
@@ -1094,6 +1120,22 @@ unlock:
 	/* Nothing migrated or mappable in place; caller falls back to nouveau_range_fault(). */
 	if (!ret && !(pfns[0] & NVIF_VMM_PFNMAP_V0_V))
 		ret = -ENOENT;
+
+	/* Throwaway debug tally; only log migrated/errored faults to spare the log. */
+	dbg_fault_calls++;
+	if (mig)
+		dbg_migrations++;
+	else
+		dbg_resident_refaults++;
+
+	if (mig || ret)
+		NV_INFO(drm,
+			"svm: migrate_fault %lx-%lx: %lu attempt(s), selected %lu, migrated %lu, copy fret %d, W %d, ret %d%s\n",
+			start, end, attempts, sel, mig, fret,
+			!ret && (pfns[0] & NVIF_VMM_PFNMAP_V0_V) ?
+				!!(pfns[0] & NVIF_VMM_PFNMAP_V0_W) : -1,
+			ret,
+			ret == -ENOENT ? " (fall back to map-in-place)" : "");
 
 	nouveau_pfns_free(pfns);
 out_free_dma:
