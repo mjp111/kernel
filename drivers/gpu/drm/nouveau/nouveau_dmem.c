@@ -40,6 +40,8 @@
 #include <linux/hmm.h>
 #include <linux/memremap.h>
 #include <linux/migrate.h>
+#include <linux/jiffies.h>
+#include <linux/delay.h>
 
 /*
  * FIXME: this is ugly right now we are using TTM to allocate vram and we pin
@@ -213,6 +215,64 @@ static void nouveau_dmem_fence_done(struct nouveau_fence **fence)
 	}
 }
 
+/*
+ * Poll the copy fence instead of the lazy (interrupt-driven) wait since
+ * completion IRQ is randomly missed, hitting the timeout. Poll gently, a
+ * jiffy at a time: a tighter interval (usleep_range()) polls the fence far
+ * more often and was found on hardware to regress to the timeout. A CPU
+ * fault on device memory thus takes at least a jiffy.
+ *
+ * Returns 0 on completion, -EBUSY on timeout. Consumes the fence reference.
+ */
+static int nouveau_dmem_fence_poll(struct nouveau_fence **fence)
+{
+	unsigned long deadline = jiffies + 30 * HZ;
+	int ret = 0;
+
+	while (!nouveau_fence_done(*fence)) {
+		if (time_after(jiffies, deadline)) {
+			ret = -EBUSY;
+			break;
+		}
+		schedule_timeout_uninterruptible(msecs_to_jiffies(1));
+	}
+	nouveau_fence_unref(fence);
+
+	return ret;
+}
+
+/*
+ * The copy could not be confirmed (fence timeout or no fence): don't migrate,
+ * so finalize restores the original ptes and the source stays valid. The copy
+ * engine may still be writing the destination, and there is no telling when
+ * it stops, so keep the destination folios: take them out of dst[], so that
+ * migrate_vma_pages() leaves the source alone and finalize doesn't free them,
+ * and keep their allocation reference. The caller skips the DMA unmap. Only
+ * the destination is written by the copy; the source is restored and stays
+ * in use.
+ *
+ * This is rare: the copy didn't complete within the deadline, because the
+ * engine is wedged or held up (e.g. behind an unreplayed GPU fault). Leaking
+ * is the safe choice then. A leaked VRAM page keeps its chunk in use, so
+ * device teardown can't complete afterwards.
+ */
+static void nouveau_dmem_migrate_abort(struct nouveau_drm *drm,
+				       struct migrate_vma *args)
+{
+	unsigned long i;
+
+	for (i = 0; i < args->npages; i++) {
+		struct page *dpage = migrate_pfn_to_page(args->dst[i]);
+
+		args->src[i] &= ~MIGRATE_PFN_MIGRATE;
+		if (dpage) {
+			folio_unlock(page_folio(dpage));
+			args->dst[i] = 0;
+		}
+	}
+	NV_ERROR(drm, "svm: copy not confirmed, migration aborted, pages leaked\n");
+}
+
 static int nouveau_dmem_copy_folio(struct nouveau_drm *drm,
 				   struct folio *sfolio, struct folio *dfolio,
 				   struct nouveau_dmem_dma_info *dma_info)
@@ -244,11 +304,11 @@ static int nouveau_dmem_copy_folio(struct nouveau_drm *drm,
 static vm_fault_t nouveau_dmem_migrate_to_ram(struct vm_fault *vmf)
 {
 	struct nouveau_drm *drm = page_to_drm(vmf->page);
-	struct nouveau_fence *fence;
+	struct nouveau_fence *fence = NULL;
 	struct nouveau_svmm *svmm;
 	struct page *dpage;
 	vm_fault_t ret = 0;
-	int err;
+	int err, fret = 0;
 	struct migrate_vma args = {
 		.vma		= vmf->vma,
 		.pgmap_owner	= drm->dev,
@@ -293,10 +353,12 @@ static vm_fault_t nouveau_dmem_migrate_to_ram(struct vm_fault *vmf)
 	 * than just one page on CPU fault. When such fault happens it is very
 	 * likely that more surrounding page will CPU fault too.
 	 */
-	if (migrate_vma_setup(&args) < 0)
-		return VM_FAULT_SIGBUS;
+	if (migrate_vma_setup(&args) < 0) {
+		ret = VM_FAULT_SIGBUS;
+		goto err;
+	}
 	if (!args.cpages)
-		return 0;
+		goto done;
 
 	if (order)
 		dpage = folio_page(vma_alloc_folio(GFP_HIGHUSER | __GFP_ZERO,
@@ -324,11 +386,34 @@ static vm_fault_t nouveau_dmem_migrate_to_ram(struct vm_fault *vmf)
 		goto done;
 	}
 
-	nouveau_dmem_fence_new(drm, &fence);
+	/*
+	 * Commit the migration only once the copy is confirmed. Without a
+	 * fence the copy can't be confirmed: treat it as failed.
+	 */
+	fret = nouveau_dmem_fence_new(drm, &fence);
+	/*
+	 * A GPU access to this page while the copy runs faults, and the GPU
+	 * fault worker waits for this migration before it can replay that
+	 * fault, which can hold up the copy. The deadline then aborts the
+	 * migration instead of committing an unconfirmed copy.
+	 */
+	if (!fret)
+		fret = nouveau_dmem_fence_poll(&fence);
+	if (fret) {
+		nouveau_dmem_migrate_abort(drm, &args);
+		/*
+		 * finalize restores the device private pte and the data is
+		 * intact: after a timeout let the CPU fault again. Without a
+		 * fence the channel is broken, and a refault would fail the
+		 * same way at once.
+		 */
+		if (fret != -EBUSY)
+			ret = VM_FAULT_SIGBUS;
+	} else {
+		dma_unmap_page(drm->dev->dev, dma_info.dma_addr, dma_info.size,
+			       DMA_BIDIRECTIONAL);
+	}
 	migrate_vma_pages(&args);
-	nouveau_dmem_fence_done(&fence);
-	dma_unmap_page(drm->dev->dev, dma_info.dma_addr, dma_info.size,
-				DMA_BIDIRECTIONAL);
 done:
 	migrate_vma_finalize(&args);
 err:
