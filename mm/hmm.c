@@ -86,6 +86,9 @@ struct hmm_vma_walk {
 #define HMM_ASSERT_PTE_LOCKED(hmm_vma_walk, locked)		\
 	WARN_ON_ONCE((hmm_vma_walk)->ptelocked != (locked))
 
+#define HMM_ASSERT_PMD_LOCKED(hmm_vma_walk, locked)		\
+	WARN_ON_ONCE((hmm_vma_walk)->pmdlocked != (locked))
+
 #define HMM_ASSERT_UNLOCKED(hmm_vma_walk)			\
 	WARN_ON_ONCE((hmm_vma_walk)->ptelocked ||		\
 		     (hmm_vma_walk)->pmdlocked)
@@ -724,8 +727,154 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 					      unsigned long end,
 					      unsigned long *hmm_pfn)
 {
-	/* Collection is implemented by later patches */
+	struct hmm_vma_walk *hmm_vma_walk = walk->private;
+	struct hmm_range *range = hmm_vma_walk->range;
+	struct migrate_vma *migrate = range->migrate;
+	struct folio *fault_folio = NULL;
+	enum migrate_vma_info minfo;
+	struct folio *folio;
+	unsigned long i;
+	pmd_t pmd;
+	int r;
+
+	/* Do we want to migrate at all? */
+	minfo = hmm_select_migrate(range);
+	if (!minfo)
+		return 0;
+
+	HMM_ASSERT_PMD_LOCKED(hmm_vma_walk, true);
+
+	fault_folio = migrate->fault_page ?
+		page_folio(migrate->fault_page) : NULL;
+
+	/*
+	 * The caller holds the pmd lock and found a huge or device private
+	 * pmd; none and migration entries it handles itself.
+	 */
+	pmd = pmdp_get(pmdp);
+
+	/* Like at the pte level, NUMA hinting (protnone) pmds are migrated */
+	if (!(hmm_pfn[0] & HMM_PFN_VALID) &&
+	    !(pmd_trans_huge(pmd) && pmd_protnone(pmd)))
+		goto out;
+
+	if (pmd_trans_huge(pmd)) {
+		folio = pmd_folio(pmd);
+		/* Like at the pte level */
+		if (folio_is_device_coherent(folio)) {
+			if (!(minfo & MIGRATE_VMA_SELECT_DEVICE_COHERENT) ||
+			    folio->pgmap->owner != migrate->pgmap_owner)
+				goto out;
+		} else {
+			if (!(minfo & MIGRATE_VMA_SELECT_SYSTEM))
+				goto out;
+			if (is_huge_zero_folio(folio)) {
+				/* See the pte level: keep a uffd-protected zero page */
+				if (userfaultfd_protected(walk->vma) &&
+				    pmd_uffd(pmd))
+					goto out;
+				return hmm_pfns_fill(start, end, hmm_vma_walk, 0);
+			}
+		}
+		/* Only anonymous memory, as at the pte level */
+		if (!folio_test_anon(folio))
+			goto out;
+		if (!hmm_migrate_collectable(range, folio_page(folio, 0),
+					     fault_folio))
+			goto out;
+
+	} else if (!pmd_present(pmd)) {
+		const softleaf_t entry = softleaf_from_pmd(pmd);
+
+		if (!softleaf_is_device_private(entry))
+			goto out;
+
+		if (!(minfo & MIGRATE_VMA_SELECT_DEVICE_PRIVATE))
+			goto out;
+
+		folio = softleaf_to_folio(entry);
+		if (folio->pgmap->owner != migrate->pgmap_owner)
+			goto out;
+		if (!hmm_migrate_collectable(range, folio_page(folio, 0),
+					     fault_folio))
+			goto out;
+	} else {
+		VM_WARN_ON_ONCE(1);
+		goto out;
+	}
+
+	folio_get(folio);
+
+	/* Can't lock it: not migrated, the valid pfns stay as reported */
+	if (folio != fault_folio && unlikely(!folio_trylock(folio))) {
+		folio_put(folio);
+		return 0;
+	}
+
+	/* Swapcache folio still referenced elsewhere: see the pte level */
+	if ((range->default_flags & HMM_PFN_REQ_FAULT) &&
+	    folio_test_swapcache(folio) && !folio_free_swap(folio)) {
+		if (folio != fault_folio)
+			folio_unlock(folio);
+		folio_put(folio);
+		return 0;
+	}
+
+	if (thp_migration_supported() &&
+	    (minfo & MIGRATE_VMA_SELECT_COMPOUND) &&
+	    (IS_ALIGNED(start, HPAGE_PMD_SIZE) &&
+	     IS_ALIGNED(end, HPAGE_PMD_SIZE))) {
+		struct page_vma_mapped_walk pvmw = {
+			.ptl = hmm_vma_walk->ptl,
+			.address = start,
+			.pmd = pmdp,
+			.vma = walk->vma,
+		};
+		bool writable = pmd_trans_huge(pmd) && pmd_write(pmd);
+
+		hmm_pfn[0] |= HMM_PFN_MIGRATE | HMM_PFN_COMPOUND;
+
+		r = set_pmd_migration_entry(&pvmw, folio_page(folio, 0));
+		if (r) {
+			hmm_pfn[0] &= ~(HMM_PFN_MIGRATE | HMM_PFN_COMPOUND);
+			goto split;	/* fall back to splitting the pmd */
+		}
+		/* Collected; a protnone pmd was not reported valid before */
+		hmm_pfn[0] |= HMM_PFN_VALID;
+		if (writable)
+			hmm_pfn[0] |= HMM_PFN_WRITE;
+		for (i = 1, start += PAGE_SIZE; start < end; start += PAGE_SIZE, i++)
+			hmm_pfn[i] &= HMM_PFN_INOUT_FLAGS;
+
+	} else {
+		goto split;		/* fall back to splitting the pmd */
+	}
+
+out:
 	return 0;
+
+split:
+	spin_unlock(hmm_vma_walk->ptl);
+	hmm_vma_walk->pmdlocked = false;
+
+	/*
+	 * folio_get() above took an extra reference. For the fault folio the
+	 * caller still holds a reference and the lock, which is the
+	 * precondition of __hmm_migrate_split_folio(), so drop the extra one.
+	 */
+	if (folio == fault_folio)
+		folio_put(folio);
+
+	/* Split failed: not migrated, the valid pfns stay as reported */
+	if (__hmm_migrate_split_folio(folio, migrate->fault_page))
+		return 0;
+
+	/* Re-walked as PTEs from start: drop the pmd-level output */
+	for (i = 0; i < (end - start) >> PAGE_SHIFT; i++)
+		hmm_pfn[i] &= HMM_PFN_INOUT_FLAGS;
+
+	hmm_vma_walk->last = start;
+	return -EBUSY;
 }
 
 /*
@@ -1211,6 +1360,17 @@ again:
 			hmm_vma_walk->pmdlocked = false;
 		}
 
+		/*
+		 * hmm_vma_handle_migrate_prepare_pmd() splits the huge pmd in
+		 * place when needed and returns -EBUSY to walk the range again
+		 * as PTEs. Without a notifier that happens in the retry loop of
+		 * hmm_range_fault_locked(). With a notifier, the split's
+		 * MMU_NOTIFY_CLEAR invalidation ends the walk with -EBUSY: the
+		 * caller aborts and retries the range under its own retry policy
+		 * (timeout), at the cost of one extra pass per huge pmd split.
+		 * That is every collected THP not migrated whole with
+		 * MIGRATE_VMA_SELECT_COMPOUND.
+		 */
 		return r;
 	}
 
