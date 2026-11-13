@@ -76,6 +76,22 @@ struct nouveau_dmem_migrate {
 	nouveau_migrate_copy_t copy_func;
 	nouveau_clear_page_t clear_func;
 	struct nouveau_channel *chan;
+	/*
+	 * Serializes the dmem users of chan (CPU faults in migrate_to_ram(),
+	 * bulk migration, eviction): the copy and clear
+	 * commands they write to its push buffer and the fences they emit.
+	 * Held only around those writes, never across memory allocation
+	 * (fences are allocated before taking it).
+	 *
+	 * chan is shared with TTM (drm->ttm.chan), which serializes its own
+	 * use with cli->mutex instead. dmem and TTM are therefore not
+	 * serialized against each other, as before this lock was added.
+	 * dmem can't take cli->mutex: dmem copies run under svmm->mutex,
+	 * while TTM may allocate memory under cli->mutex, and an allocation
+	 * can enter reclaim, whose mmu notifier invalidation takes
+	 * svmm->mutex.
+	 */
+	struct mutex lock;
 };
 
 struct nouveau_dmem {
@@ -92,6 +108,51 @@ struct nouveau_dmem_dma_info {
 	dma_addr_t dma_addr;
 	size_t size;
 };
+
+static int nouveau_dmem_copy(struct nouveau_drm *drm, u64 npages,
+			     enum nouveau_aper dst_aper, u64 dst_addr,
+			     enum nouveau_aper src_aper, u64 src_addr)
+{
+	int ret;
+
+	mutex_lock(&drm->dmem->migrate.lock);
+	ret = drm->dmem->migrate.copy_func(drm, npages, dst_aper, dst_addr,
+					   src_aper, src_addr);
+	mutex_unlock(&drm->dmem->migrate.lock);
+	return ret;
+}
+
+static int nouveau_dmem_clear(struct nouveau_drm *drm, u32 length,
+			      enum nouveau_aper dst_aper, u64 dst_addr)
+{
+	int ret;
+
+	mutex_lock(&drm->dmem->migrate.lock);
+	ret = drm->dmem->migrate.clear_func(drm, length, dst_aper, dst_addr);
+	mutex_unlock(&drm->dmem->migrate.lock);
+	return ret;
+}
+
+static int nouveau_dmem_fence_new(struct nouveau_drm *drm,
+				  struct nouveau_fence **fence)
+{
+	int ret;
+
+	/*
+	 * nouveau_fence_new() without the allocation under migrate.lock:
+	 * the fence is allocated first, the lock only covers the emit.
+	 */
+	ret = nouveau_fence_create(fence, drm->dmem->migrate.chan);
+	if (ret)
+		return ret;
+
+	mutex_lock(&drm->dmem->migrate.lock);
+	ret = nouveau_fence_emit(*fence);
+	mutex_unlock(&drm->dmem->migrate.lock);
+	if (ret)
+		nouveau_fence_unref(fence);
+	return ret;
+}
 
 static struct nouveau_dmem_chunk *nouveau_page_to_chunk(struct page *page)
 {
@@ -168,10 +229,10 @@ static int nouveau_dmem_copy_folio(struct nouveau_drm *drm,
 	if (dma_mapping_error(dev, dma_info->dma_addr))
 		return -EIO;
 
-	if (drm->dmem->migrate.copy_func(drm, folio_nr_pages(sfolio),
-					 NOUVEAU_APER_HOST, dma_info->dma_addr,
-					 NOUVEAU_APER_VRAM,
-					 nouveau_dmem_page_addr(spage))) {
+	if (nouveau_dmem_copy(drm, folio_nr_pages(sfolio),
+			      NOUVEAU_APER_HOST, dma_info->dma_addr,
+			      NOUVEAU_APER_VRAM,
+			      nouveau_dmem_page_addr(spage))) {
 		dma_unmap_page(dev, dma_info->dma_addr, page_size(dpage),
 					DMA_BIDIRECTIONAL);
 		return -EIO;
@@ -183,7 +244,6 @@ static int nouveau_dmem_copy_folio(struct nouveau_drm *drm,
 static vm_fault_t nouveau_dmem_migrate_to_ram(struct vm_fault *vmf)
 {
 	struct nouveau_drm *drm = page_to_drm(vmf->page);
-	struct nouveau_dmem *dmem = drm->dmem;
 	struct nouveau_fence *fence;
 	struct nouveau_svmm *svmm;
 	struct page *dpage;
@@ -264,7 +324,7 @@ static vm_fault_t nouveau_dmem_migrate_to_ram(struct vm_fault *vmf)
 		goto done;
 	}
 
-	nouveau_fence_new(&fence, dmem->migrate.chan);
+	nouveau_dmem_fence_new(drm, &fence);
 	migrate_vma_pages(&args);
 	nouveau_dmem_fence_done(&fence);
 	dma_unmap_page(drm->dev->dev, dma_info.dma_addr, dma_info.size,
@@ -528,7 +588,7 @@ nouveau_dmem_evict_chunk(struct nouveau_dmem_chunk *chunk)
 		}
 	}
 
-	nouveau_fence_new(&fence, chunk->drm->dmem->migrate.chan);
+	nouveau_dmem_fence_new(chunk->drm, &fence);
 	migrate_device_pages(src_pfns, dst_pfns, npages);
 	nouveau_dmem_fence_done(&fence);
 	migrate_device_finalize(src_pfns, dst_pfns, npages);
@@ -729,6 +789,7 @@ nouveau_dmem_init(struct nouveau_drm *drm)
 	INIT_LIST_HEAD(&drm->dmem->chunks);
 	mutex_init(&drm->dmem->mutex);
 	spin_lock_init(&drm->dmem->lock);
+	mutex_init(&drm->dmem->migrate.lock);
 
 	/* Initialize migration dma helpers before registering memory */
 	ret = nouveau_dmem_migrate_init(drm);
@@ -764,13 +825,13 @@ static unsigned long nouveau_dmem_migrate_copy_one(struct nouveau_drm *drm,
 		dma_info->size = page_size(spage);
 		if (dma_mapping_error(dev, dma_info->dma_addr))
 			goto out_free_page;
-		if (drm->dmem->migrate.copy_func(drm, folio_nr_pages(page_folio(spage)),
+		if (nouveau_dmem_copy(drm, folio_nr_pages(page_folio(spage)),
 			NOUVEAU_APER_VRAM, paddr, NOUVEAU_APER_HOST,
 			dma_info->dma_addr))
 			goto out_dma_unmap;
 	} else {
 		dma_info->dma_addr = DMA_MAPPING_ERROR;
-		if (drm->dmem->migrate.clear_func(drm, page_size(dpage),
+		if (nouveau_dmem_clear(drm, page_size(dpage),
 			NOUVEAU_APER_VRAM, paddr))
 			goto out_free_page;
 	}
@@ -820,7 +881,7 @@ static void nouveau_dmem_migrate_chunk(struct nouveau_drm *drm,
 		addr += (1 << order) * PAGE_SIZE;
 	}
 
-	nouveau_fence_new(&fence, drm->dmem->migrate.chan);
+	nouveau_dmem_fence_new(drm, &fence);
 	migrate_vma_pages(args);
 	nouveau_dmem_fence_done(&fence);
 	nouveau_pfns_map(svmm, args->vma->vm_mm, args->start, pfns, i, order);
