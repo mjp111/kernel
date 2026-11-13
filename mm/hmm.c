@@ -73,6 +73,19 @@ struct hmm_vma_walk {
  */
 #define HMM_FAULT_UNLOCKED	-ENOLCK
 
+/*
+ * Internal results of hmm_vma_handle_migrate_prepare(), consumed by
+ * hmm_vma_walk_pmd() and never propagated. Both mean the pte lock was
+ * dropped: HMM_MIGRATE_REWALK after splitting a large folio, so the pmd
+ * range is walked again; HMM_MIGRATE_SKIP when a large folio can't be
+ * locked or split, so the rest of the pmd range is skipped (best effort).
+ */
+#define HMM_MIGRATE_REWALK	1
+#define HMM_MIGRATE_SKIP	2
+
+#define HMM_ASSERT_PTE_LOCKED(hmm_vma_walk, locked)		\
+	WARN_ON_ONCE((hmm_vma_walk)->ptelocked != (locked))
+
 #define HMM_ASSERT_UNLOCKED(hmm_vma_walk)			\
 	WARN_ON_ONCE((hmm_vma_walk)->ptelocked ||		\
 		     (hmm_vma_walk)->pmdlocked)
@@ -555,6 +568,75 @@ static int hmm_vma_handle_absent_pmd(struct mm_walk *walk, unsigned long start,
 #endif  /* CONFIG_ARCH_HAS_PMD_SOFTLEAVES */
 
 #ifdef CONFIG_DEVICE_MIGRATION
+/**
+ * __hmm_migrate_split_folio() - split a locked folio for migration
+ * @folio: the folio to split, locked and referenced by the caller
+ * @fault_page: fault page if any
+ *
+ * The fault folio is split at @fault_page, so the caller's lock and reference
+ * stay on the folio containing @fault_page. For any other folio our lock and
+ * reference are dropped, whether or not the split succeeds.
+ *
+ * Return: 0 on success, or the split_huge_page() / split_folio() error.
+ */
+static int __hmm_migrate_split_folio(struct folio *folio,
+				     struct page *fault_page)
+{
+	int ret;
+
+	if (fault_page && folio == page_folio(fault_page))
+		return split_huge_page(fault_page);
+
+	/* Found large under the page table lock and locked since: still large */
+	ret = folio_test_large(folio) ? split_folio(folio) : 0;
+	folio_unlock(folio);
+	folio_put(folio);
+	return ret;
+}
+
+/**
+ * hmm_migrate_split_folio() - drop the pte lock and split a THP folio
+ * @folio: the folio to split
+ * @fault_page: struct page associated with the fault if any
+ * @hmm_vma_walk: walk in progress
+ * @ptep: pte_t * for unmap and unlock ptl
+ *
+ * Always drops the pte lock associated with @ptep.
+ *
+ * Return: 0 on success, -EBUSY if the folio is locked by someone else, or the
+ * split_huge_page() / split_folio() error.
+ */
+static int hmm_migrate_split_folio(struct folio *folio,
+				   struct page *fault_page,
+				   struct hmm_vma_walk *hmm_vma_walk,
+				   pte_t *ptep)
+{
+	struct folio *fault_folio = fault_page ? page_folio(fault_page) : NULL;
+	bool locked = true;
+
+	/*
+	 * Take the reference while still holding the PTE lock, so the folio
+	 * cannot be freed once the lock is dropped. As at collection, only
+	 * trylock: other collected folios may be held locked, so sleeping
+	 * here could deadlock. A busy folio is just not migrated. The fault
+	 * folio is already referenced and locked by do_swap_page().
+	 */
+	if (folio != fault_folio) {
+		folio_get(folio);
+		locked = folio_trylock(folio);
+	}
+
+	pte_unmap_unlock(ptep, hmm_vma_walk->ptl);
+	hmm_vma_walk->ptelocked = false;
+
+	if (!locked) {
+		folio_put(folio);
+		return -EBUSY;
+	}
+
+	return __hmm_migrate_split_folio(folio, fault_page);
+}
+
 /*
  * Due to dropping ptl locks for splitting for instance, would we
  * overwrite already collected pfns? This could happen when pmd
@@ -603,6 +685,39 @@ static void hmm_vma_handle_migrate_prepare_rollback(const struct hmm_vma_walk *h
 	}
 }
 
+/*
+ * Collected folios stay locked while hmm_range_fault() faults other pages
+ * of the range. Without faulting nothing sleeps while holding them, so any
+ * folio is collected. When faulting, only the fault folio and folios mapped
+ * by this process alone (PageAnonExclusive) are collected.
+ *
+ * A folio also mapped by another process (after fork, or KSM) can be
+ * reached through that mapping by another faulting walk, which then sleeps
+ * on our folio lock (a write fault on a shared THP in do_huge_pmd_wp_page(),
+ * or a fault on a device private entry in do_swap_page()) while we may
+ * sleep on its. Such folios are left as reported. This is a deliberate
+ * trade-off of the faulting path, and a rare one: a write fault breaks the
+ * sharing first, so the walk then finds an exclusive folio and collects it,
+ * and only read faults on pages still shared (after fork, until written,
+ * or KSM) leave them in system memory, where the device can still map them.
+ * In exchange, walks that fault can't deadlock on each other:
+ * an exclusive folio is mapped only through our migration entry, so another
+ * walk can only wait on that entry (migration_entry_wait()), and those waits
+ * can't form a cycle. A walk records a fault and stops, so everything it
+ * holds was collected before the check that led to the fault, and a walk
+ * that finds another walk's migration entry leaves it without waiting. If
+ * walk A sleeps on walk B's entry, B installed it after A's check and before
+ * its own, so every wait goes to a walk with a later check.
+ */
+static bool hmm_migrate_collectable(const struct hmm_range *range,
+				    struct page *page,
+				    struct folio *fault_folio)
+{
+	if (!(range->default_flags & HMM_PFN_REQ_FAULT))
+		return true;
+	return page_folio(page) == fault_folio || PageAnonExclusive(page);
+}
+
 static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 					      pmd_t *pmdp,
 					      unsigned long start,
@@ -613,6 +728,10 @@ static int hmm_vma_handle_migrate_prepare_pmd(const struct mm_walk *walk,
 	return 0;
 }
 
+/*
+ * Install migration entries if migration requested, either from fault
+ * or migrate paths.
+ */
 static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 					  pmd_t *pmdp,
 					  pte_t *ptep,
@@ -620,8 +739,247 @@ static int hmm_vma_handle_migrate_prepare(const struct mm_walk *walk,
 					  unsigned long *hmm_pfn,
 					  bool *unmapped)
 {
-	/* Collection is implemented by later patches */
+	struct hmm_vma_walk *hmm_vma_walk = walk->private;
+	struct hmm_range *range = hmm_vma_walk->range;
+	struct migrate_vma *migrate = range->migrate;
+	struct mm_struct *mm = walk->vma->vm_mm;
+	struct folio *fault_folio = NULL;
+	enum migrate_vma_info minfo;
+	struct dev_pagemap *pgmap;
+	bool anon_exclusive;
+	struct folio *folio;
+	unsigned long pfn;
+	struct page *page;
+	softleaf_t entry;
+	pte_t pte, swp_pte;
+	bool writable = false;
+
+	/* Do we want to migrate at all? */
+	minfo = hmm_select_migrate(range);
+	if (!minfo)
+		return 0;
+
+	HMM_ASSERT_PTE_LOCKED(hmm_vma_walk, true);
+
+	fault_folio = migrate->fault_page ?
+		page_folio(migrate->fault_page) : NULL;
+
+	pte = ptep_get(ptep);
+
+	if (pte_none(pte)) {
+		if (vma_is_anonymous(walk->vma)) {
+			*hmm_pfn &= HMM_PFN_INOUT_FLAGS;
+			*hmm_pfn |= HMM_PFN_MIGRATE;
+			goto out;
+		}
+	}
+
+	/*
+	 * NUMA hinting (protnone) entries are not reported valid, but the
+	 * page can still be migrated as is.
+	 */
+	if (!(hmm_pfn[0] & HMM_PFN_VALID) &&
+	    !(pte_present(pte) && pte_protnone(pte)))
+		goto out;
+
+	if (!pte_present(pte)) {
+		/*
+		 * Only care about unaddressable device page special
+		 * page table entry. Other special swap entries are not
+		 * migratable, and we ignore regular swapped page.
+		 */
+		entry = softleaf_from_pte(pte);
+		if (!softleaf_is_device_private(entry))
+			goto out;
+
+		if (!(minfo & MIGRATE_VMA_SELECT_DEVICE_PRIVATE))
+			goto out;
+
+		page = softleaf_to_page(entry);
+		folio = page_folio(page);
+		if (folio->pgmap->owner != migrate->pgmap_owner)
+			goto out;
+		if (!hmm_migrate_collectable(range, page, fault_folio))
+			goto out;
+
+		if (folio_test_large(folio)) {
+			int ret;
+
+			ret = hmm_migrate_split_folio(folio,
+						      migrate->fault_page,
+						      hmm_vma_walk,
+						      ptep);
+			if (ret)
+				goto out_skip;
+			return HMM_MIGRATE_REWALK;
+		}
+
+		pfn = page_to_pfn(page);
+		if (softleaf_is_device_private_write(entry))
+			writable = true;
+	} else {
+		pfn = pte_pfn(pte);
+		if (is_zero_pfn(pfn) &&
+		    (minfo & MIGRATE_VMA_SELECT_SYSTEM)) {
+			/* Like pte_none(): only anonymous memory can be populated */
+			if (!vma_is_anonymous(walk->vma))
+				goto out;
+			/* Nothing carries the uffd state of the zero page over */
+			if (userfaultfd_protected(walk->vma) && pte_uffd(pte))
+				goto out;
+			*hmm_pfn &= HMM_PFN_INOUT_FLAGS;
+			*hmm_pfn |= HMM_PFN_MIGRATE;
+			goto out;
+		}
+		page = vm_normal_page(walk->vma, addr, pte);
+		if (page && !is_zone_device_page(page) &&
+		    !(minfo & MIGRATE_VMA_SELECT_SYSTEM)) {
+			goto out;
+		} else if (page && is_device_coherent_page(page)) {
+			pgmap = page_pgmap(page);
+
+			if (!(minfo &
+			      MIGRATE_VMA_SELECT_DEVICE_COHERENT) ||
+			    pgmap->owner != migrate->pgmap_owner)
+				goto out;
+		}
+
+		folio = page ? page_folio(page) : NULL;
+		/*
+		 * Only anonymous memory can be migrated to device memory.
+		 * Check before splitting. KSM folios are collected unless
+		 * faulting (see hmm_migrate_collectable()), and
+		 * __migrate_device_pages() refuses them for device private
+		 * destinations.
+		 */
+		if (!folio || !folio_test_anon(folio))
+			goto out;
+		if (!hmm_migrate_collectable(range, page, fault_folio))
+			goto out;
+		if (folio_test_large(folio)) {
+			int ret;
+
+			ret = hmm_migrate_split_folio(folio,
+						      migrate->fault_page,
+						      hmm_vma_walk,
+						      ptep);
+			if (ret)
+				goto out_skip;
+			return HMM_MIGRATE_REWALK;
+		}
+
+		writable = pte_write(pte);
+	}
+
+	/*
+	 * By getting a reference on the folio we pin it and that blocks
+	 * any kind of migration. Side effect is that it "freezes" the
+	 * pte.
+	 *
+	 * We drop this reference after isolating the folio from the lru
+	 * for non device folio (device folio are not on the lru and thus
+	 * can't be dropped from it).
+	 */
+	folio = page_folio(page);
+	folio_get(folio);
+
+	/*
+	 * We rely on folio_trylock() to avoid deadlock between
+	 * concurrent migrations where each is waiting on the others
+	 * folio lock. If we can't immediately lock the folio we fail this
+	 * migration as it is only best effort anyway.
+	 *
+	 * If we can lock the folio it's safe to set up a migration entry
+	 * now. In the common case where the folio is mapped once in a
+	 * single process setting up the migration entry now is an
+	 * optimisation to avoid walking the rmap later with
+	 * try_to_migrate().
+	 */
+
+	if (fault_folio == folio || folio_trylock(folio)) {
+		/*
+		 * When faulting, a swapcache folio still referenced by other
+		 * swap entries isn't collected: faulting one of those entries
+		 * later in the walk, with no retry allowed, would block on the
+		 * lock we hold. It couldn't be migrated anyway (see
+		 * __migrate_device_pages()). Without faulting the swap cache is
+		 * left alone here and freed only when the folio is migrated.
+		 */
+		if ((range->default_flags & HMM_PFN_REQ_FAULT) &&
+		    folio_test_swapcache(folio) && !folio_free_swap(folio)) {
+			if (fault_folio != folio)
+				folio_unlock(folio);
+			folio_put(folio);
+			goto out;
+		}
+
+		anon_exclusive = folio_test_anon(folio) &&
+			PageAnonExclusive(page);
+
+		if (pte_present(pte))
+			flush_cache_page(walk->vma, addr, pfn);
+
+		if (anon_exclusive) {
+			pte = ptep_clear_flush(walk->vma, addr, ptep);
+
+			if (folio_try_share_anon_rmap_pte(folio, page)) {
+				set_pte_at(mm, addr, ptep, pte);
+				if (fault_folio != folio)
+					folio_unlock(folio);
+				folio_put(folio);
+				goto out;
+			}
+		} else {
+			pte = ptep_get_and_clear(mm, addr, ptep);
+		}
+
+		if (pte_present(pte) && pte_dirty(pte))
+			folio_mark_dirty(folio);
+
+		/* Setup special migration page table entry */
+		if (writable)
+			entry = make_writable_migration_entry(pfn);
+		else if (anon_exclusive)
+			entry = make_readable_exclusive_migration_entry(pfn);
+		else
+			entry = make_readable_migration_entry(pfn);
+
+		if (pte_present(pte)) {
+			if (pte_young(pte))
+				entry = make_migration_entry_young(entry);
+			if (pte_dirty(pte))
+				entry = make_migration_entry_dirty(entry);
+		}
+
+		swp_pte = swp_entry_to_pte(entry);
+		if (pte_present(pte)) {
+			if (pte_soft_dirty(pte))
+				swp_pte = pte_swp_mksoft_dirty(swp_pte);
+			if (pte_uffd(pte))
+				swp_pte = pte_swp_mkuffd(swp_pte);
+		} else {
+			if (pte_swp_soft_dirty(pte))
+				swp_pte = pte_swp_mksoft_dirty(swp_pte);
+			if (pte_swp_uffd(pte))
+				swp_pte = pte_swp_mkuffd(swp_pte);
+		}
+
+		set_pte_at(mm, addr, ptep, swp_pte);
+		folio_remove_rmap_pte(folio, page, walk->vma);
+		folio_put(folio);
+		*hmm_pfn |= HMM_PFN_VALID | HMM_PFN_MIGRATE;
+		if (writable)
+			*hmm_pfn |= HMM_PFN_WRITE;
+		if (pte_present(pte))
+			*unmapped = true;
+	} else {
+		folio_put(folio);
+	}
+out:
 	return 0;
+out_skip:
+	/* Lock or split failed: the caller skips the rest of the pmd (best effort) */
+	return HMM_MIGRATE_SKIP;
 }
 
 #else
@@ -880,8 +1238,14 @@ again:
 	} else {
 		ptep = pte_offset_map(pmdp, addr);
 	}
-	if (!ptep)
+	if (!ptep) {
+		/*
+		 * The pte table is gone: re-walk from start, entries collected
+		 * from the old table are rolled back as they are revisited.
+		 */
+		addr = start;
 		goto again;
+	}
 
 	for (; addr < end; addr += PAGE_SIZE, ptep++, hmm_pfns++) {
 
@@ -893,8 +1257,37 @@ again:
 			return r;
 		}
 
-		/* Collection is added by later patches: a no-op until then */
-		hmm_vma_handle_migrate_prepare(walk, pmdp, ptep, addr, hmm_pfns, &unmapped);
+		r = hmm_vma_handle_migrate_prepare(walk, pmdp, ptep, addr, hmm_pfns, &unmapped);
+		if (r == HMM_MIGRATE_REWALK) {
+			HMM_ASSERT_UNLOCKED(hmm_vma_walk);
+			if (unmapped) {
+				flush_tlb_range(walk->vma, start, addr);
+				unmapped = false;
+			}
+			/*
+			 * The pte lock was dropped and the pte table may have
+			 * changed: re-walk from start. Our own migration entries
+			 * are kept, anything else collected is rolled back.
+			 */
+			addr = start;
+			goto again;
+		}
+		if (r == HMM_MIGRATE_SKIP) {
+			/*
+			 * Locking or splitting the folio failed, and the split
+			 * helper already dropped the PTE lock. addr keeps its
+			 * valid pfn. The rest of the pmd range is not walked
+			 * further, as migrate_vma_setup() has always done:
+			 * entries there keep what an earlier pass wrote, and
+			 * entries already collected stay collected. When
+			 * migrating, collection and faulting are best effort
+			 * (see hmm_range_fault()).
+			 */
+			HMM_ASSERT_UNLOCKED(hmm_vma_walk);
+			if (unmapped)
+				flush_tlb_range(walk->vma, start, addr);
+			return 0;
+		}
 	}
 
 	if (unmapped)
