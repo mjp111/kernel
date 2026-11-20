@@ -141,7 +141,8 @@ static void nouveau_dmem_folio_free(struct folio *folio)
 
 static void nouveau_dmem_fence_done(struct nouveau_fence **fence)
 {
-	if (fence) {
+	/* nouveau_fence_new() leaves no fence behind when it fails */
+	if (*fence) {
 		nouveau_fence_wait(*fence, true, false);
 		nouveau_fence_unref(fence);
 	} else {
@@ -184,7 +185,7 @@ static vm_fault_t nouveau_dmem_migrate_to_ram(struct vm_fault *vmf)
 {
 	struct nouveau_drm *drm = page_to_drm(vmf->page);
 	struct nouveau_dmem *dmem = drm->dmem;
-	struct nouveau_fence *fence;
+	struct nouveau_fence *fence = NULL;
 	struct nouveau_svmm *svmm;
 	struct page *dpage;
 	vm_fault_t ret = 0;
@@ -504,7 +505,7 @@ nouveau_dmem_evict_chunk(struct nouveau_dmem_chunk *chunk)
 	unsigned long i, npages = range_len(&chunk->pagemap.range) >> PAGE_SHIFT;
 	unsigned long *src_pfns, *dst_pfns;
 	struct nouveau_dmem_dma_info *dma_info;
-	struct nouveau_fence *fence;
+	struct nouveau_fence *fence = NULL;
 
 	src_pfns = kvzalloc_objs(*src_pfns, npages, GFP_KERNEL | __GFP_NOFAIL);
 	dst_pfns = kvzalloc_objs(*dst_pfns, npages, GFP_KERNEL | __GFP_NOFAIL);
@@ -811,7 +812,7 @@ static void nouveau_dmem_migrate_chunk(struct nouveau_drm *drm,
 		struct nouveau_svmm *svmm, struct migrate_vma *args,
 		struct nouveau_dmem_dma_info *dma_info, u64 *pfns)
 {
-	struct nouveau_fence *fence;
+	struct nouveau_fence *fence = NULL;
 	unsigned long addr = args->start, nr_dma = 0, i;
 	unsigned long order = 0;
 
