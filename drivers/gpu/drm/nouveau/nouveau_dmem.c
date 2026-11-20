@@ -238,6 +238,12 @@ static vm_fault_t nouveau_dmem_migrate_to_ram(struct vm_fault *vmf)
 	if (!args.cpages)
 		return 0;
 
+	/*
+	 * Collecting a page of a large folio on a pte fault splits the folio:
+	 * copy from the folio that now holds the faulting page.
+	 */
+	sfolio = page_folio(vmf->page);
+
 	if (order)
 		dpage = folio_page(vma_alloc_folio(GFP_HIGHUSER | __GFP_ZERO,
 					order, vmf->vma, vmf->address), 0);
