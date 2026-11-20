@@ -837,7 +837,8 @@ static void nouveau_dmem_migrate_chunk(struct nouveau_drm *drm,
 	nouveau_fence_new(&fence, drm->dmem->migrate.chan);
 	migrate_vma_pages(args);
 	nouveau_dmem_fence_done(&fence);
-	nouveau_pfns_map(svmm, args->vma->vm_mm, args->start, pfns, i, order);
+	nouveau_pfns_map(svmm, args->vma->vm_mm, args->start, pfns, i,
+			 PAGE_SHIFT + order);
 
 	while (nr_dma--) {
 		dma_unmap_page(drm->dev->dev, dma_info[nr_dma].dma_addr,
