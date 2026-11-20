@@ -821,6 +821,7 @@ nouveau_svm_fault(struct work_struct *work)
 		 * Determine required permissions based on GPU fault
 		 * access flags.
 		 */
+		atomic = false;
 		switch (buffer->fault[fi]->access) {
 		case 0: /* READ. */
 			hmm_flags = HMM_PFN_REQ_FAULT;
