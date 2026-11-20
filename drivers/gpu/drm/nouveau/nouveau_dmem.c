@@ -266,6 +266,13 @@ static vm_fault_t nouveau_dmem_migrate_to_ram(struct vm_fault *vmf)
 	err = nouveau_dmem_copy_folio(drm, sfolio, dfolio, &dma_info);
 	mutex_unlock(&svmm->mutex);
 	if (err) {
+		/*
+		 * Nothing was copied: drop the destination, so that
+		 * finalize restores the source instead of mapping it.
+		 */
+		args.dst[0] = 0;
+		folio_unlock(dfolio);
+		folio_put(dfolio);
 		ret = VM_FAULT_SIGBUS;
 		goto done;
 	}
