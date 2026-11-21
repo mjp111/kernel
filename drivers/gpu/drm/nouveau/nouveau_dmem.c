@@ -748,7 +748,6 @@ nouveau_dmem_init(struct nouveau_drm *drm)
 	drm->dmem->drm = drm;
 	mutex_init(&drm->dmem->mutex);
 	INIT_LIST_HEAD(&drm->dmem->chunks);
-	mutex_init(&drm->dmem->mutex);
 	spin_lock_init(&drm->dmem->lock);
 
 	/* Initialize migration dma helpers before registering memory */
