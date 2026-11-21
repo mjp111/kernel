@@ -535,10 +535,12 @@ nouveau_dmem_evict_chunk(struct nouveau_dmem_chunk *chunk)
 			}
 
 			dst_pfns[i] = migrate_pfn(page_to_pfn(dpage));
-			nouveau_dmem_copy_folio(chunk->drm,
+			/* On failure nothing is left mapped: don't unmap it below */
+			if (nouveau_dmem_copy_folio(chunk->drm,
 				page_folio(migrate_pfn_to_page(src_pfns[i])),
 				page_folio(dpage),
-				&dma_info[i]);
+				&dma_info[i]))
+				dma_info[i].size = 0;
 		}
 	}
 
@@ -548,9 +550,11 @@ nouveau_dmem_evict_chunk(struct nouveau_dmem_chunk *chunk)
 	migrate_device_finalize(src_pfns, dst_pfns, npages);
 	kvfree(src_pfns);
 	kvfree(dst_pfns);
+	/* Only entries that were migrated and copied are mapped */
 	for (i = 0; i < npages; i++)
-		dma_unmap_page(chunk->drm->dev->dev, dma_info[i].dma_addr,
-				dma_info[i].size, DMA_BIDIRECTIONAL);
+		if (dma_info[i].size)
+			dma_unmap_page(chunk->drm->dev->dev, dma_info[i].dma_addr,
+				       dma_info[i].size, DMA_BIDIRECTIONAL);
 	kvfree(dma_info);
 }
 
