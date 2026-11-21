@@ -580,6 +580,9 @@ nouveau_dmem_fini(struct nouveau_drm *drm)
 	}
 
 	mutex_unlock(&drm->dmem->mutex);
+
+	kfree(drm->dmem);
+	drm->dmem = NULL;
 }
 
 static int
